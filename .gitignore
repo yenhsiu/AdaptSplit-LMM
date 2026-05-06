@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+
+# Distribution / packaging
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Model checkpoints & weights
+checkpoints/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Eval datasets & results
+playground/data/eval/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Misc
+*.log
+.DS_Store
+PRUMERGE_METHOD=*
+
+*.pyc
+

@@ -2,8 +2,7 @@
 
 
 python -m llava.eval.model_vqa_science \
-    --model-base lmsys/vicuna-13b-v1.5 \
-    --model-path /data/shangyuzhang/LLaVA/checkpoints/llava-v1.5-13b-lora-20240315-to \
+    --model-path /mnt/ssd/yenhsiu_checkpoints/llava-v1.5-7b-prunemerge-merged \
     --question-file ./playground/data/eval/scienceqa/llava_test_CQM-A.json \
     --image-folder ./playground/data/eval/scienceqa/images/test \
     --answers-file ./playground/data/eval/scienceqa/answers/llava-v1.5-7b.jsonl \

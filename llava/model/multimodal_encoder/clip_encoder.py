@@ -7,7 +7,7 @@ from transformers import CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig
 import matplotlib.pyplot as plt
 import numpy as np
 import json
-
+from turboquant.compressors_v3 import MSECompressor
 
 def complement_idx(idx, dim):
     a = torch.arange(dim, device=idx.device)
@@ -295,9 +295,19 @@ class CLIPVisionTower(nn.Module):
             # image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
             # image_features = self.feature_select(image_forward_outs).to(images.dtype)
 
-            # image_features = self.token_prune_merge_advanced(images, if_adaptive=True, reduction_ratio=1/8)
+            image_features = self.token_prune_merge_advanced(images, if_adaptive=True, reduction_ratio=1/8)
             
-            image_features = self.token_prune_merge_advanced_plus(images, if_adaptive=True, reduction_ratio=1/8) 
+            # image_features = self.token_prune_merge_advanced_plus(images, if_adaptive=True, reduction_ratio=1/8)
+
+            # original_dtype = image_features.dtype
+            # tokens_4d = image_features.unsqueeze(1)
+            # compressed = self.compressor.compress(tokens_4d)
+            # reconstructed = self.compressor.decompress(compressed)
+            # image_features_q = reconstructed.squeeze(1).to(dtype=original_dtype)
+
+            # diff = (image_features_q.float() - image_features.float()).abs()
+            # print(f"Max diff: {diff.max().item():.6f}, Mean diff: {diff.mean().item():.6f}")
+            # exit()
 
         return image_features
 
