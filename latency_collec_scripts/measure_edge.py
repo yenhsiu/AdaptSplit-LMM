@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
 Edge-side latency measurement.
-Measures: T_edge (ViT), T_vit_prumerge (ViT+PruMerge+TurboQuant), T_quant, T_tx
+Measures: T_edge (ViT only), T_vit_prumerge (ViT + PruMerge_advanced + PruMerge_plus), T_quant, T_tx
 
-Run on: Raspberry Pi 4B / Jetson Nano / Jetson AGX Orin
-Does NOT load any pretrained weights — uses randomly initialised models.
-Latency depends only on architecture (computation graph), not weight values.
+Model architecture matches actual inference (openai/clip-vit-large-patch14-336, float16).
+Does NOT load pretrained weights or dataset — random float16 input is sufficient for compute-time profiling.
 
 Usage:
     python measure_edge.py --device "Jetson AGX Orin"
@@ -17,31 +16,31 @@ import csv
 import platform
 import statistics
 import sys
-import os
 import time
+from pathlib import Path
 from typing import Optional
 
 import torch
 import torch.nn as nn
 
-# ── Repo paths ────────────────────────────────────────────────────────────────
+# ── Repo path ─────────────────────────────────────────────────────────────────
 
-for p in [os.path.expanduser("~/LLaVA-PruMerge"),
-          os.path.expanduser("~/turboquant-pytorch")]:
-    if p not in sys.path:
-        sys.path.insert(0, p)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-N_VALUES      = [15, 20, 25, 30, 35, 40, 50, 60]
+# N_VALUES covers actual PruMerge output range:
+#   token_prune_merge_advanced      → ~19 tokens  (float16, POPE)
+#   token_prune_merge_advanced_plus → ~96 tokens  (float16, POPE)
+N_VALUES      = [15, 19, 25, 35, 50, 75, 96, 150]
 BIT_VALUES    = [4, 2, 1]
 BW_VALUES     = [1, 5, 20]       # Mbps
 TOKEN_DIM     = 1024
 WARMUP        = 10
 REPEAT_EDGE   = 100
-REPEAT_PM     = 20               # PruMerge is slow, fewer reps
+REPEAT_PM     = 20
 REPEAT_QUANT  = 100
-PRUMERGE_BITS = 1                # bits used in CLIPVisionTower.load_model()
+PRUMERGE_BITS = 1
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -85,126 +84,82 @@ def detect_system_info() -> dict:
 
 def measure_t_edge(device: torch.device) -> dict:
     """
-    CLIPVisionModel (ViT-L/14-336) with random weights.
-    Architecture matches openai/clip-vit-large-patch14-336 exactly.
-    No pretrained download needed — latency depends only on architecture.
+    CLIPVisionModel (ViT-L/14-336) with random weights, float16.
+    Architecture matches openai/clip-vit-large-patch14-336.
+    No pretrained download needed.
     """
     from transformers import CLIPVisionModel, CLIPVisionConfig
 
     config = CLIPVisionConfig(
-        hidden_size=1024,
-        intermediate_size=4096,
-        num_hidden_layers=24,
-        num_attention_heads=16,
-        image_size=336,
-        patch_size=14,
-        projection_dim=768,
+        hidden_size=1024, intermediate_size=4096,
+        num_hidden_layers=24, num_attention_heads=16,
+        image_size=336, patch_size=14, projection_dim=768,
     )
-    print("  Building CLIPVisionModel (ViT-L/14-336, random weights) …", flush=True)
-    model = CLIPVisionModel(config).to(device).eval()
-    pv = torch.randn(1, 3, 336, 336, device=device)
+    print("  Building CLIPVisionModel (ViT-L/14-336, random weights, float16) …", flush=True)
+    model = CLIPVisionModel(config).to(device=device, dtype=torch.float16).eval()
+    pv = torch.randn(1, 3, 336, 336, device=device, dtype=torch.float16)
 
     def run():
         with torch.no_grad():
             model(pixel_values=pv, output_hidden_states=True)
 
     mean, std = timed_run(run, WARMUP, REPEAT_EDGE)
-    return {"mean_ms": mean, "std_ms": std, "model": "CLIPVisionModel(ViT-L/14-336, random)", "fallback": False}
+    return {"mean_ms": mean, "std_ms": std,
+            "model": "CLIPVisionModel(ViT-L/14-336, random)", "fallback": False}
 
 # ── T_vit_prumerge ────────────────────────────────────────────────────────────
 
 def measure_t_vit_prumerge(device: torch.device) -> dict:
     """
-    Real CLIPVisionTower.forward() with internal timing from latency_log.
-    Breakdown: Stage1(ViT) / Stage2(Attn+TopK) / Stage3(Merge loop) / Stage4(TurboQuant)
+    CLIPVisionTower.forward() — same function as actual inference.
+    Calls token_prune_merge_advanced then token_prune_merge_advanced_plus (as in forward()).
+    Random weights, float16. n_out read directly from output tensor.
     """
     try:
         from llava.model.multimodal_encoder.clip_encoder import CLIPVisionTower
-        from turboquant.compressors_v3 import MSECompressor
     except ImportError as e:
         print(f"  [WARN] Import failed: {e}")
-        return {"mean_ms": None, "std_ms": None, "n_out": None, "breakdown": {}}
+        return {"mean_ms": None, "std_ms": None, "n_out": None}
 
     try:
-        print("  Building CLIPVisionTower (ViT-L + PruMerge, random weights) …", flush=True)
+        print("  Building CLIPVisionTower (ViT-L + PruMerge, random weights, float16) …", flush=True)
         tower = CLIPVisionTower.__new__(CLIPVisionTower)
         nn.Module.__init__(tower)
-        tower.is_loaded      = False
+        tower.is_loaded         = False
         tower.vision_tower_name = "openai/clip-vit-large-patch14-336"
-        tower.select_layer   = -2
-        tower.select_feature = "patch"
-        tower.total_tokens   = 0
+        tower.select_layer      = -2
+        tower.select_feature    = "patch"
+        tower.total_tokens      = 0
 
         from transformers import CLIPVisionModel, CLIPVisionConfig
         config = CLIPVisionConfig(
-            hidden_size=1024,
-            intermediate_size=4096,
-            num_hidden_layers=24,
-            num_attention_heads=16,
-            image_size=336,
-            patch_size=14,
-            projection_dim=768,
+            hidden_size=1024, intermediate_size=4096,
+            num_hidden_layers=24, num_attention_heads=16,
+            image_size=336, patch_size=14, projection_dim=768,
         )
-        tower.image_processor = None          # not needed for latency measurement
+        tower.image_processor = None
         tower.vision_tower    = CLIPVisionModel(config)
         tower.vision_tower.requires_grad_(False)
-
-        dev_str = "cuda" if torch.cuda.is_available() else "cpu"
-        tower.compressor = MSECompressor(head_dim=1024, bits=PRUMERGE_BITS,
-                                         seed=42, device=dev_str)
         tower.is_loaded = True
-        tower = tower.to(device).eval()
+        tower = tower.to(device=device, dtype=torch.float16).eval()
     except Exception as e:
         print(f"  [WARN] CLIPVisionTower setup failed: {e}")
-        return {"mean_ms": None, "std_ms": None, "n_out": None, "breakdown": {}}
+        return {"mean_ms": None, "std_ms": None, "n_out": None}
 
-    pv = torch.randn(1, 3, 336, 336, device=device)
+    pv = torch.randn(1, 3, 336, 336, device=device, dtype=torch.float16)
 
-    # Warm-up
-    tower.latency_log = []
-    for _ in range(3):
+    # Warm-up and get n_out from actual output shape
+    with torch.no_grad():
+        out = tower(pv)
+    n_out = out.size(1)
+    print(f"  PruMerge+ output: {n_out} tokens", flush=True)
+
+    def run():
         with torch.no_grad():
             tower(pv)
 
-    n_out = tower.latency_log[-1]["left_tokens"] + 1
-    ratio = tower.latency_log[-1]["reduction_ratio"]
-    print(f"  PruMerge output: {n_out} tokens (ratio={ratio:.3f})", flush=True)
-
-    # Timed runs
-    tower.latency_log = []
-    total_times = []
-    for _ in range(REPEAT_PM):
-        sync()
-        t0 = time.perf_counter()
-        with torch.no_grad():
-            tower(pv)
-        sync()
-        total_times.append((time.perf_counter() - t0) * 1000.0)
-
-    # Per-stage breakdown from latency_log
-    stage_keys = ["t_vit_ms", "t_attn_topk_ms", "t_merge_loop_ms"]
-    breakdown = {}
-    for k in stage_keys:
-        vals = [e[k] for e in tower.latency_log]
-        breakdown[k] = {"mean_ms": sum(vals)/len(vals),
-                        "std_ms": statistics.stdev(vals) if len(vals) > 1 else 0.0}
-
-    mean_total = sum(total_times) / len(total_times)
-    std_total  = statistics.stdev(total_times) if len(total_times) > 1 else 0.0
-
-    breakdown["t_quant_derived_ms"] = max(
-        mean_total
-        - breakdown["t_vit_ms"]["mean_ms"]
-        - breakdown["t_attn_topk_ms"]["mean_ms"]
-        - breakdown["t_merge_loop_ms"]["mean_ms"],
-        0.0
-    )
-
-    return {
-        "mean_ms": mean_total, "std_ms": std_total,
-        "n_out": n_out, "reduction_ratio": ratio,
-        "breakdown": breakdown,
-    }
+    mean, std = timed_run(run, WARMUP, REPEAT_PM)
+    return {"mean_ms": mean, "std_ms": std, "n_out": n_out}
 
 # ── T_quant ───────────────────────────────────────────────────────────────────
 
@@ -260,26 +215,13 @@ def print_results(device_name, sys_info, t_edge, t_pm, quant, tx_table):
     print(f"  RAM       : {sys_info['ram_gb']} GB")
     print(f"  PyTorch   : {sys_info['torch']}")
 
-    hdr("T_edge  （CLIPVisionModel，純 ViT）")
+    hdr("T_edge  （CLIPVisionModel，純 ViT，random weights，float16）")
     fb = "[fallback: ViT-B]" if t_edge.get("fallback") else ""
-    row(f"T_edge ({t_edge['model'].split('/')[-1]})", t_edge["mean_ms"], t_edge["std_ms"], fb)
+    row("T_edge", t_edge["mean_ms"], t_edge["std_ms"], fb)
 
-    hdr("T_vit_prumerge  （ViT + PruMerge + TurboQuant）")
+    hdr("T_vit_prumerge  （CLIPVisionTower.forward()，ViT + PruMerge_advanced + PruMerge_plus）")
     n_out = t_pm.get("n_out")
-    note  = f"→ {n_out} tokens" if n_out else ""
-    row("總計", t_pm["mean_ms"], t_pm["std_ms"], note)
-    bd = t_pm.get("breakdown", {})
-    if bd:
-        print()
-        for label, key in [
-            ("  ├ Stage 1  ViT forward",       "t_vit_ms"),
-            ("  ├ Stage 2  Attn+TopK+Gather",  "t_attn_topk_ms"),
-            ("  ├ Stage 3  Merge loop",         "t_merge_loop_ms"),
-        ]:
-            d = bd[key]
-            row(label, d["mean_ms"], d["std_ms"])
-        tq = bd.get("t_quant_derived_ms", 0.0)
-        print(f"  {'  └ Stage 4  TurboQuant（推算）':<34} {tq:8.3f} ms")
+    row("總計", t_pm["mean_ms"], t_pm["std_ms"], f"→ {n_out} tokens" if n_out else "")
 
     hdr("T_quant  （MSECompressor，各 N × bits 組合）")
     if not quant:
@@ -310,16 +252,8 @@ def export_csv(device_name, t_edge, t_pm, quant, tx_table):
         t_edge["mean_ms"], t_edge["std_ms"],
         t_edge["model"] + (" [fallback]" if t_edge["fallback"] else ""))
 
-    bd = t_pm.get("breakdown", {})
-    add("T_vit_prumerge", t_pm.get("n_out",""), "", "",
-        t_pm["mean_ms"], t_pm["std_ms"], t_pm.get("note",""))
-    if bd:
-        for k, label in [("t_vit_ms","T_vit_stage1"), ("t_attn_topk_ms","T_vit_stage2"),
-                         ("t_merge_loop_ms","T_vit_stage3")]:
-            add(label, t_pm.get("n_out",""), "", "",
-                bd[k]["mean_ms"], bd[k]["std_ms"], "")
-        add("T_quant_derived", t_pm.get("n_out",""), PRUMERGE_BITS, "",
-            bd.get("t_quant_derived_ms", 0.0), 0.0, "derived from total")
+    add("T_vit_prumerge", t_pm.get("n_out", ""), "", "",
+        t_pm["mean_ms"], t_pm["std_ms"], "CLIPVisionTower.forward()")
 
     for (n, b), d in quant.items():
         add("T_quant", n, b, "", d["mean_ms"], d["std_ms"], "MSECompressor")
@@ -341,7 +275,7 @@ def main():
     parser.add_argument("--device", type=str, default="Unknown Device")
     parser.add_argument("--skip-edge",     action="store_true")
     parser.add_argument("--skip-prumerge", action="store_true",
-                        help="跳過 T_vit_prumerge（記憶體不足或 PruMerge 未安裝時使用）")
+                        help="跳過 T_vit_prumerge（記憶體不足時使用）")
     args = parser.parse_args()
 
     device   = get_device()
@@ -359,7 +293,7 @@ def main():
         t_edge = measure_t_edge(device)
 
     if args.skip_prumerge:
-        t_pm = {"mean_ms": None, "std_ms": None, "n_out": None, "breakdown": {}}
+        t_pm = {"mean_ms": None, "std_ms": None, "n_out": None}
     else:
         print("\n[2/4] T_vit_prumerge …")
         t_pm = measure_t_vit_prumerge(device)
@@ -367,7 +301,7 @@ def main():
     print("\n[3/4] T_quant …")
     quant = measure_t_quant(device)
 
-    print("\n[4/4] T_tx（公式計算，無需推論）")
+    print("\n[4/4] T_tx（公式計算）")
     tx_table = build_t_tx_table()
 
     print_results(args.device, sys_info, t_edge, t_pm, quant, tx_table)

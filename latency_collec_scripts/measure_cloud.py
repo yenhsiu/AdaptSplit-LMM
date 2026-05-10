@@ -24,7 +24,7 @@ import torch.nn as nn
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-N_VALUES     = [15, 20, 25, 30, 35, 40, 50, 60]
+N_VALUES     = [15, 19, 25, 35, 50, 75, 96, 150]
 PROJ_DIM     = 4096      # LLaVA projector output dim (1024 → 4096)
 WARMUP       = 10
 REPEAT_CLOUD = 50

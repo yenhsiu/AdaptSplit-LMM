@@ -26,16 +26,11 @@ import torch.nn as nn
 
 # ── Repo paths ────────────────────────────────────────────────────────────────
 
-LLAVA_PATH   = os.path.expanduser("~/LLaVA-PruMerge")
-TURBOQUANT_PATH = os.path.expanduser("~/turboquant-pytorch")
-
-for p in [LLAVA_PATH, TURBOQUANT_PATH]:
-    if p not in sys.path:
-        sys.path.insert(0, p)
+sys.path.insert(0, str(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-N_VALUES        = [15, 20, 25, 30, 35, 40, 50, 60]
+N_VALUES        = [15, 19, 25, 35, 50, 75, 96, 150]
 BIT_VALUES      = [4, 2, 1]
 BW_VALUES       = [1, 5, 20]            # Mbps
 TOKEN_DIM       = 1024                   # CLIP hidden dim
@@ -106,141 +101,92 @@ def detect_system_info() -> dict:
 
 def measure_t_edge(device: torch.device) -> dict:
     """
-    CLIPVisionModel only — no PruMerge, no TurboQuant.
-    This is the pure ViT inference baseline.
+    CLIPVisionModel (ViT-L/14-336) with random weights, float16.
+    Architecture matches openai/clip-vit-large-patch14-336.
+    No pretrained download needed — latency depends only on architecture.
     """
-    model_name = "openai/clip-vit-large-patch14-336"
-    fallback    = "openai/clip-vit-base-patch16"
-    used_model  = model_name
-    used_fallback = False
+    from transformers import CLIPVisionModel, CLIPVisionConfig
 
-    try:
-        from transformers import CLIPVisionModel
-        print(f"  Loading {model_name} …", flush=True)
-        model = CLIPVisionModel.from_pretrained(model_name)
-    except Exception as e:
-        print(f"  [WARN] {model_name} failed: {e}")
-        print(f"  Falling back to {fallback} …", flush=True)
-        try:
-            from transformers import CLIPVisionModel
-            model = CLIPVisionModel.from_pretrained(fallback)
-            used_model, used_fallback = fallback, True
-        except Exception as e2:
-            print(f"  [ERROR] Fallback also failed: {e2}")
-            return {"mean_ms": None, "std_ms": None, "model": "FAILED", "fallback": True}
-
-    model = model.to(device).eval()
-    pixel_values = torch.randn(1, 3, 336, 336, device=device)
+    config = CLIPVisionConfig(
+        hidden_size=1024, intermediate_size=4096,
+        num_hidden_layers=24, num_attention_heads=16,
+        image_size=336, patch_size=14, projection_dim=768,
+    )
+    print("  Building CLIPVisionModel (ViT-L/14-336, random weights, float16) …", flush=True)
+    model = CLIPVisionModel(config).to(device=device, dtype=torch.float16).eval()
+    pv = torch.randn(1, 3, 336, 336, device=device, dtype=torch.float16)
 
     def run():
         with torch.no_grad():
-            model(pixel_values=pixel_values, output_hidden_states=True)
+            model(pixel_values=pv, output_hidden_states=True)
 
     mean, std = timed_run(run, WARMUP, REPEAT_EDGE)
-    return {"mean_ms": mean, "std_ms": std, "model": used_model, "fallback": used_fallback}
+    return {"mean_ms": mean, "std_ms": std,
+            "model": "CLIPVisionModel(ViT-L/14-336, random)", "fallback": False}
 
 
 # ── T_vit_prumerge ────────────────────────────────────────────────────────────
 
 def measure_t_vit_prumerge(device: torch.device) -> dict:
     """
-    Real CLIPVisionTower.forward() with internal timing instrumentation.
-
-    Reads tower.latency_log after each call to get per-stage breakdown:
-      t_vit_ms        : ViT forward pass (inside token_prune_merge_advanced)
-      t_attn_topk_ms  : attention matrix + outlier detection + top-k + gather
-      t_merge_loop_ms : weighted merge for loop (the expensive part)
-    Plus T_quant (compress+decompress) is timed separately here.
-
-    Note: load_model() hardcodes device="cuda" for MSECompressor.
-    We patch it here so it works on CPU (Raspberry Pi) too.
+    CLIPVisionTower.forward() — same function as actual inference.
+    Calls token_prune_merge_advanced then token_prune_merge_advanced_plus (as in forward()).
+    Random weights, float16. n_out read directly from output tensor.
     """
     try:
         from llava.model.multimodal_encoder.clip_encoder import CLIPVisionTower
-        from turboquant.compressors_v3 import MSECompressor
     except ImportError as e:
-        print(f"  [WARN] Cannot import CLIPVisionTower / MSECompressor: {e}")
+        print(f"  [WARN] Cannot import CLIPVisionTower: {e}")
         return {"mean_ms": None, "std_ms": None, "n_out": None, "note": "IMPORT_FAILED",
                 "breakdown": {}}
 
     try:
-        print("  Loading CLIPVisionTower (ViT-L + PruMerge) …", flush=True)
+        print("  Building CLIPVisionTower (ViT-L + PruMerge, random weights, float16) …", flush=True)
         tower = CLIPVisionTower.__new__(CLIPVisionTower)
         nn.Module.__init__(tower)
-        tower.is_loaded      = False
+        tower.is_loaded         = False
         tower.vision_tower_name = "openai/clip-vit-large-patch14-336"
-        tower.select_layer   = -2
-        tower.select_feature = "patch"
-        tower.total_tokens   = 0
+        tower.select_layer      = -2
+        tower.select_feature    = "patch"
+        tower.total_tokens      = 0
 
-        from transformers import CLIPVisionModel, CLIPImageProcessor
-        tower.image_processor = CLIPImageProcessor.from_pretrained(tower.vision_tower_name)
-        tower.vision_tower    = CLIPVisionModel.from_pretrained(tower.vision_tower_name)
+        from transformers import CLIPVisionModel, CLIPVisionConfig
+        config = CLIPVisionConfig(
+            hidden_size=1024, intermediate_size=4096,
+            num_hidden_layers=24, num_attention_heads=16,
+            image_size=336, patch_size=14, projection_dim=768,
+        )
+        tower.image_processor = None
+        tower.vision_tower    = CLIPVisionModel(config)
         tower.vision_tower.requires_grad_(False)
-
-        dev_str = "cuda" if torch.cuda.is_available() else "cpu"
-        tower.compressor = MSECompressor(head_dim=1024, bits=PRUMERGE_BITS,
-                                         seed=42, device=dev_str)
         tower.is_loaded = True
-        tower = tower.to(device).eval()
+        tower = tower.to(device=device, dtype=torch.float16).eval()
 
     except Exception as e:
         print(f"  [WARN] CLIPVisionTower setup failed: {e}")
         return {"mean_ms": None, "std_ms": None, "n_out": None, "note": str(e),
                 "breakdown": {}}
 
-    pixel_values = torch.randn(1, 3, 336, 336, device=device)
+    pv = torch.randn(1, 3, 336, 336, device=device, dtype=torch.float16)
 
-    # Warm-up (also populates latency_log)
-    tower.latency_log = []
-    for _ in range(3):
+    # Warm-up and get n_out from actual output shape
+    with torch.no_grad():
+        out = tower(pv)
+    n_out = out.size(1)
+    print(f"  PruMerge+ output: {n_out} tokens", flush=True)
+
+    def run():
         with torch.no_grad():
-            tower(pixel_values)
+            tower(pv)
 
-    n_out = tower.latency_log[-1]["left_tokens"] + 1  # +1 for extra_one_token
-    print(f"  PruMerge output: {n_out} tokens (from 576), "
-          f"reduction_ratio={tower.latency_log[-1]['reduction_ratio']:.3f}", flush=True)
-
-    # Timed runs — collect total wall time AND per-stage breakdown
-    tower.latency_log = []
-    total_times = []
-
-    for _ in range(REPEAT_VIT_PM):
-        sync()
-        t0 = time.perf_counter()
-        with torch.no_grad():
-            tower(pixel_values)
-        sync()
-        total_times.append((time.perf_counter() - t0) * 1000.0)
-
-    # Aggregate per-stage from latency_log (one entry per call)
-    keys = ["t_vit_ms", "t_attn_topk_ms", "t_merge_loop_ms"]
-    breakdown = {}
-    for k in keys:
-        vals = [e[k] for e in tower.latency_log]
-        breakdown[k] = {"mean_ms": sum(vals) / len(vals),
-                        "std_ms":  statistics.stdev(vals) if len(vals) > 1 else 0.0}
-
-    mean_total = sum(total_times) / len(total_times)
-    std_total  = statistics.stdev(total_times) if len(total_times) > 1 else 0.0
-
-    # T_quant (compress+decompress) is timed as the residual:
-    # total = t_vit + t_attn_topk + t_merge_loop + t_quant
-    t_quant_derived = max(
-        mean_total
-        - breakdown["t_vit_ms"]["mean_ms"]
-        - breakdown["t_attn_topk_ms"]["mean_ms"]
-        - breakdown["t_merge_loop_ms"]["mean_ms"],
-        0.0
-    )
-    breakdown["t_quant_derived_ms"] = t_quant_derived
+    mean, std = timed_run(run, WARMUP, REPEAT_VIT_PM)
 
     return {
-        "mean_ms":   mean_total,
-        "std_ms":    std_total,
+        "mean_ms":   mean,
+        "std_ms":    std,
         "n_out":     n_out,
-        "note":      f"ViT+PruMerge+TurboQuant({PRUMERGE_BITS}bit)",
-        "breakdown": breakdown,
+        "note":      "CLIPVisionTower.forward() (PruMerge_advanced + PruMerge_plus)",
+        "breakdown": {},
     }
 
 
@@ -295,10 +241,9 @@ def build_t_tx_table() -> list[dict]:
 
 # ── T_cloud ───────────────────────────────────────────────────────────────────
 
-# Local paths for LLaVA-PruMerge LoRA checkpoint
-LORA_CKPT  = "/mnt/ssd/yenhsiu_checkpoints/llava-v1.5-7b-lora-prunemerge"
-VICUNA_BASE = ("/mnt/ssd/yenhsiu_hf_cache/hub/models--lmsys--vicuna-7b-v1.5"
-               "/snapshots/3321f76e3f527bd14065daf69dad9344000a201d")
+# LLaVA-PruMerge LoRA checkpoint (matches pope.sh / mme.sh / textvqa.sh)
+LORA_CKPT   = "/mnt/ssd/yuzhang_models/llava-prumerge-vicuna-7b-v1.5-lora"
+VICUNA_BASE = "lmsys/vicuna-7b-v1.5"
 
 
 class FakeLLMPrefill(nn.Module):
