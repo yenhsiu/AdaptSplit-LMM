@@ -18,7 +18,7 @@ import statistics
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple, Dict, List
 
 import torch
 import torch.nn as nn
@@ -51,7 +51,7 @@ def sync():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
-def timed_run(fn, n_warmup: int, n_repeat: int) -> tuple[float, float]:
+def timed_run(fn, n_warmup: int, n_repeat: int) -> Tuple[float, float]:
     for _ in range(n_warmup):
         fn()
     sync()
@@ -116,7 +116,8 @@ def measure_t_vit_prumerge(device: torch.device) -> dict:
     Random weights, float16. n_out read directly from output tensor.
     """
     try:
-        from llava.model.multimodal_encoder.clip_encoder import CLIPVisionTower
+        from llava.model.multimodal_encoder.clip_encoder_t import CLIPVisionTower
+        from turboquant.compressors_v3 import MSECompressor
     except ImportError as e:
         print(f"  [WARN] Import failed: {e}")
         return {"mean_ms": None, "std_ms": None, "n_out": None}
@@ -140,6 +141,10 @@ def measure_t_vit_prumerge(device: torch.device) -> dict:
         tower.image_processor = None
         tower.vision_tower    = CLIPVisionModel(config)
         tower.vision_tower.requires_grad_(False)
+
+        dev_str = "cuda" if torch.cuda.is_available() else "cpu"
+        tower.compressor = MSECompressor(head_dim=1024, bits=PRUMERGE_BITS,
+                                         seed=42, device=dev_str)
         tower.is_loaded = True
         tower = tower.to(device=device, dtype=torch.float16).eval()
     except Exception as e:
@@ -148,22 +153,55 @@ def measure_t_vit_prumerge(device: torch.device) -> dict:
 
     pv = torch.randn(1, 3, 336, 336, device=device, dtype=torch.float16)
 
-    # Warm-up and get n_out from actual output shape
-    with torch.no_grad():
-        out = tower(pv)
-    n_out = out.size(1)
-    print(f"  PruMerge+ output: {n_out} tokens", flush=True)
-
-    def run():
+    # Warm-up
+    tower.latency_log = []
+    for _ in range(3):
         with torch.no_grad():
             tower(pv)
 
-    mean, std = timed_run(run, WARMUP, REPEAT_PM)
-    return {"mean_ms": mean, "std_ms": std, "n_out": n_out}
+    n_out = tower.latency_log[-1]["left_tokens"] + 1
+    ratio = tower.latency_log[-1]["reduction_ratio"]
+    print(f"  PruMerge output: {n_out} tokens (ratio={ratio:.3f})", flush=True)
+
+    # Timed runs
+    tower.latency_log = []
+    total_times = []
+    for _ in range(REPEAT_PM):
+        sync()
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            tower(pv)
+        sync()
+        total_times.append((time.perf_counter() - t0) * 1000.0)
+
+    # Per-stage breakdown from latency_log
+    stage_keys = ["t_vit_ms", "t_attn_topk_ms", "t_merge_loop_ms"]
+    breakdown = {}
+    for k in stage_keys:
+        vals = [e[k] for e in tower.latency_log]
+        breakdown[k] = {"mean_ms": sum(vals)/len(vals),
+                        "std_ms": statistics.stdev(vals) if len(vals) > 1 else 0.0}
+
+    mean_total = sum(total_times) / len(total_times)
+    std_total  = statistics.stdev(total_times) if len(total_times) > 1 else 0.0
+
+    breakdown["t_quant_derived_ms"] = max(
+        mean_total
+        - breakdown["t_vit_ms"]["mean_ms"]
+        - breakdown["t_attn_topk_ms"]["mean_ms"]
+        - breakdown["t_merge_loop_ms"]["mean_ms"],
+        0.0
+    )
+
+    return {
+        "mean_ms": mean_total, "std_ms": std_total,
+        "n_out": n_out, "reduction_ratio": ratio,
+        "breakdown": breakdown,
+    }
 
 # ── T_quant ───────────────────────────────────────────────────────────────────
 
-def measure_t_quant(device: torch.device) -> dict[tuple, dict]:
+def measure_t_quant(device: torch.device) -> Dict[Tuple[int, int], Dict]:
     """MSECompressor.compress() + decompress() for all (N, bits) combos."""
     try:
         from turboquant.compressors_v3 import MSECompressor
@@ -172,7 +210,7 @@ def measure_t_quant(device: torch.device) -> dict[tuple, dict]:
         return {}
 
     dev_str = "cuda" if torch.cuda.is_available() else "cpu"
-    results: dict[tuple, dict] = {}
+    results: Dict[Tuple[int, int], Dict] = {}
 
     for bits in BIT_VALUES:
         c = MSECompressor(head_dim=TOKEN_DIM, bits=bits, seed=42, device=dev_str)
@@ -190,7 +228,7 @@ def measure_t_quant(device: torch.device) -> dict[tuple, dict]:
 def calc_t_tx(n: int, bits: int, bw_mbps: float) -> float:
     return n * TOKEN_DIM * bits / (bw_mbps * 1_000_000) * 1000.0
 
-def build_t_tx_table() -> list[dict]:
+def build_t_tx_table() -> List[Dict]:
     return [{"N": n, "bits": b, "bw_mbps": s, "t_tx_ms": calc_t_tx(n, b, s)}
             for n in N_VALUES for b in BIT_VALUES for s in BW_VALUES]
 
@@ -221,7 +259,20 @@ def print_results(device_name, sys_info, t_edge, t_pm, quant, tx_table):
 
     hdr("T_vit_prumerge  （CLIPVisionTower.forward()，ViT + PruMerge_advanced + PruMerge_plus）")
     n_out = t_pm.get("n_out")
-    row("總計", t_pm["mean_ms"], t_pm["std_ms"], f"→ {n_out} tokens" if n_out else "")
+    note  = f"→ {n_out} tokens" if n_out else ""
+    row("總計", t_pm["mean_ms"], t_pm["std_ms"], note)
+    bd = t_pm.get("breakdown", {})
+    if bd:
+        print()
+        for label, key in [
+            ("  ├ Stage 1  ViT forward",       "t_vit_ms"),
+            ("  ├ Stage 2  Attn+TopK+Gather",  "t_attn_topk_ms"),
+            ("  ├ Stage 3  Merge loop",         "t_merge_loop_ms"),
+        ]:
+            d = bd[key]
+            row(label, d["mean_ms"], d["std_ms"])
+        tq = bd.get("t_quant_derived_ms", 0.0)
+        print(f"  {'  └ Stage 4  TurboQuant（推算）':<34} {tq:8.3f} ms")
 
     hdr("T_quant  （MSECompressor，各 N × bits 組合）")
     if not quant:

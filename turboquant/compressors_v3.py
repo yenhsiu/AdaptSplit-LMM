@@ -19,7 +19,7 @@ References:
 import torch
 import torch.nn.functional as F
 import math
-from typing import Optional
+from typing import Optional, Tuple, Dict
 
 from .lloyd_max import LloydMaxCodebook
 from .turboquant import generate_rotation_matrix
@@ -43,7 +43,7 @@ class MSECompressor:
         self.centroids = LloydMaxCodebook(head_dim, bits).centroids.to(device)
 
     @torch.no_grad()
-    def compress(self, states: torch.Tensor) -> dict:
+    def compress(self, states: torch.Tensor) -> Dict:
         """
         Compress (B, H, S, D) -> dict with bit-packed indices + norms.
         """
@@ -170,7 +170,7 @@ class TurboQuantV3:
     @torch.no_grad()
     def compress_kv(
         self, keys: torch.Tensor, values: torch.Tensor
-    ) -> tuple[dict, dict]:
+    ) -> Tuple[Dict, Dict]:
         """
         Compress key and value tensors.
         Input: keys, values — both (B, H, S, D)
@@ -213,8 +213,8 @@ class TurboQuantV3:
 
     @torch.no_grad()
     def decompress_kv(
-        self, compressed_k: dict, compressed_v: dict
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, compressed_k: Dict, compressed_v: Dict
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Decompress back to full tensors.
         Returns: keys (B, H, S, D), values (B, H, S, D)
