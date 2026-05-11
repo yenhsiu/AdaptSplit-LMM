@@ -9,7 +9,7 @@ Measurement breakdown:
   T_quant         : MSECompressor.compress() + decompress() per (N, bits), 100 runs
   T_prumerge      : T_vit_prumerge - T_edge - T_quant(N_actual, bits=1)  [derived]
   T_tx            : formula, no actual transmission
-  T_cloud         : FakeLLM (Linear 4096→4096), 50 runs
+  T_cloud         : LLaVA-PruMerge LoRA (real) or LlamaForCausalLM (random weights, same arch), 50 runs
 """
 
 import argparse
@@ -276,27 +276,35 @@ LORA_CKPT   = "/mnt/ssd/yuzhang_models/llava-prumerge-vicuna-7b-v1.5-lora"
 VICUNA_BASE = "lmsys/vicuna-7b-v1.5"
 
 
-class FakeLLMPrefill(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.layer = nn.Linear(PROJ_DIM, PROJ_DIM, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layer(x)
+def _build_random_llm(device: torch.device) -> nn.Module:
+    """LlamaForCausalLM with Vicuna-7B architecture and randomly initialized weights."""
+    from transformers import LlamaForCausalLM, LlamaConfig
+    config = LlamaConfig(
+        hidden_size=4096,
+        intermediate_size=11008,
+        num_hidden_layers=32,
+        num_attention_heads=32,
+        num_key_value_heads=32,
+        vocab_size=32000,
+        max_position_embeddings=4096,
+    )
+    print("  Building LlamaForCausalLM (Vicuna-7B arch, random weights, float16) …", flush=True)
+    return LlamaForCausalLM(config).to(device=device, dtype=torch.float16).eval()
 
 
 def measure_t_cloud(device: torch.device) -> Dict[int, Dict]:
     """
-    Load LlavaLlamaForCausalLM from local LoRA checkpoint + Vicuna-7B base,
-    then measure prefill latency by passing (1, N, 4096) inputs_embeds
-    directly to the language model (bypassing vision encoder).
+    Tier 1: load LlavaLlamaForCausalLM from local LoRA checkpoint + Vicuna-7B base.
+    Tier 2: if weights not found, build LlamaForCausalLM with random weights (same arch).
+    Returns empty dict if both fail.
 
-    Falls back to FakeLLM if loading fails.
+    Prefill is measured by passing (1, N, 4096) inputs_embeds directly to the LM.
     """
-    using_fake  = True
-    model_label = "FakeLLM (Linear 4096→4096)"
-    llava       = None
+    mode        = "random"   # "real" | "random"
+    model_label = "LlamaForCausalLM (Vicuna-7B arch, random weights)"
+    llm         = None
 
+    # Tier 1 — real LoRA weights
     try:
         from llava.model.builder import load_pretrained_model
 
@@ -304,41 +312,40 @@ def measure_t_cloud(device: torch.device) -> Dict[int, Dict]:
         print(f"    base : {VICUNA_BASE}", flush=True)
         print(f"    lora : {LORA_CKPT}", flush=True)
 
-        # load_pretrained_model merges LoRA weights into the base model
         _, llava, _, _ = load_pretrained_model(
             model_path=LORA_CKPT,
             model_base=VICUNA_BASE,
-            model_name="llava-lora-prunemerge",   # must contain "llava" and "lora"
+            model_name="llava-lora-prunemerge",
             device=str(device),
             device_map={"": device},
         )
-        llava = llava.eval()
-        using_fake  = False
-        model_label = f"LLaVA-PruMerge LoRA (Vicuna-7B)"
+        llm         = llava.eval()
+        mode        = "real"
+        model_label = "LLaVA-PruMerge LoRA (Vicuna-7B)"
 
     except Exception as e:
         print(f"  [WARN] LLaVA-PruMerge load failed: {e}", flush=True)
-        print(f"  Falling back to FakeLLM.", flush=True)
-        llava = FakeLLMPrefill().to(device).eval()
+
+        # Tier 2 — same architecture, random weights
+        try:
+            llm = _build_random_llm(device)
+        except Exception as e2:
+            print(f"  [ERROR] Random LLM build also failed: {e2}", flush=True)
+            return {}
 
     results: Dict[int, Dict] = {}
     for n in N_VALUES:
-        dtype  = torch.float16 if not using_fake else torch.float32
-        # Shape (1, N, 4096): simulate Projector output fed into LLM
-        tokens = torch.randn(1, n, PROJ_DIM, device=device, dtype=dtype)
-
-        if using_fake:
-            def run(tok=tokens):
-                with torch.no_grad():
-                    llava(tok.squeeze(0))
-        else:
-            def run(tok=tokens):
-                with torch.no_grad():
-                    # Feed directly as inputs_embeds — skips embedding lookup
-                    llava.model(inputs_embeds=tok, use_cache=False)
+        tokens = torch.randn(1, n, PROJ_DIM, device=device, dtype=torch.float16)
+        def run(tok=tokens):
+            with torch.no_grad():
+                llm.model(inputs_embeds=tok, use_cache=False)
 
         mean, std = timed_run(run, max(WARMUP, 5), REPEAT_CLOUD)
-        results[n] = {"mean_ms": mean, "std_ms": std, "model": model_label, "fake": using_fake}
+        results[n] = {
+            "mean_ms": mean, "std_ms": std,
+            "model": model_label,
+            "random": mode == "random",
+        }
 
     return results
 
@@ -460,8 +467,8 @@ def print_results(
 
     # ── T_cloud ──
     hdr(f"T_cloud  （Cloud LLM prefill）  [{cloud[N_VALUES[0]]['model']}]")
-    if cloud[N_VALUES[0]]["fake"]:
-        print("  [注意] 使用 FakeLLM (Linear) 模擬")
+    if cloud[N_VALUES[0]].get("random"):
+        print("  [注意] 使用隨機初始化的 LLaMA-7B 架構（無預訓練權重）")
     for n in N_VALUES:
         d = cloud[n]
         row(f"N={n}", d["mean_ms"], d["std_ms"])
@@ -473,7 +480,7 @@ def print_results(
     scenarios = [
         ("最佳情況", (15, 1, 20)),
         ("典型情況", (35, 4,  5)),
-        ("最差情況", (60, 4,  1)),
+        ("最差情況", (75, 4,  1)),
     ]
     e2e_results = []
     for label, sc in scenarios:
@@ -526,8 +533,8 @@ def export_csv(
         add("T_tx", r["N"], r["bits"], r["bw_mbps"], r["t_tx_ms"], 0.0, "calculated")
 
     for n, d in cloud.items():
-        add("T_cloud", n, "", "", d["mean_ms"], d["std_ms"],
-            d["model"] + (" [fake]" if d["fake"] else ""))
+        suffix = " [random weights]" if d.get("random") else ""
+        add("T_cloud", n, "", "", d["mean_ms"], d["std_ms"], d["model"] + suffix)
 
     fields = ["component", "N", "bits", "bw_mbps", "mean_ms", "std_ms", "note"]
     with open(fname, "w", newline="") as f:
@@ -582,7 +589,7 @@ def main():
 
     # ── T_cloud ──
     if args.skip_cloud:
-        cloud = {n: {"mean_ms": 0.0, "std_ms": 0.0, "model": "skipped", "fake": True}
+        cloud = {n: {"mean_ms": 0.0, "std_ms": 0.0, "model": "skipped", "random": False}
                   for n in N_VALUES}
     else:
         print("\n[4/4] 測量 T_cloud …")
