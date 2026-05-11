@@ -19,7 +19,7 @@ import sys
 import os
 import time
 import statistics
-from typing import Optional
+from typing import Optional, Tuple, Dict, List
 
 import torch
 import torch.nn as nn
@@ -56,7 +56,7 @@ def sync():
         torch.cuda.synchronize()
 
 
-def timed_run(fn, n_warmup: int, n_repeat: int) -> tuple[float, float]:
+def timed_run(fn, n_warmup: int, n_repeat: int) -> Tuple[float, float]:
     """Warm-up then time fn; return (mean_ms, std_ms)."""
     for _ in range(n_warmup):
         fn()
@@ -134,7 +134,8 @@ def measure_t_vit_prumerge(device: torch.device) -> dict:
     Random weights, float16. n_out read directly from output tensor.
     """
     try:
-        from llava.model.multimodal_encoder.clip_encoder import CLIPVisionTower
+        from llava.model.multimodal_encoder.clip_encoder_t import CLIPVisionTower
+        from turboquant.compressors_v3 import MSECompressor
     except ImportError as e:
         print(f"  [WARN] Cannot import CLIPVisionTower: {e}")
         return {"mean_ms": None, "std_ms": None, "n_out": None, "note": "IMPORT_FAILED",
@@ -159,9 +160,12 @@ def measure_t_vit_prumerge(device: torch.device) -> dict:
         tower.image_processor = None
         tower.vision_tower    = CLIPVisionModel(config)
         tower.vision_tower.requires_grad_(False)
+
+        dev_str = "cuda" if torch.cuda.is_available() else "cpu"
+        tower.compressor = MSECompressor(head_dim=1024, bits=PRUMERGE_BITS,
+                                         seed=42, device=dev_str)
         tower.is_loaded = True
         tower = tower.to(device=device, dtype=torch.float16).eval()
-
     except Exception as e:
         print(f"  [WARN] CLIPVisionTower setup failed: {e}")
         return {"mean_ms": None, "std_ms": None, "n_out": None, "note": str(e),
@@ -169,30 +173,56 @@ def measure_t_vit_prumerge(device: torch.device) -> dict:
 
     pv = torch.randn(1, 3, 336, 336, device=device, dtype=torch.float16)
 
-    # Warm-up and get n_out from actual output shape
-    with torch.no_grad():
-        out = tower(pv)
-    n_out = out.size(1)
-    print(f"  PruMerge+ output: {n_out} tokens", flush=True)
-
-    def run():
+    # Warm-up
+    tower.latency_log = []
+    for _ in range(3):
         with torch.no_grad():
             tower(pv)
 
-    mean, std = timed_run(run, WARMUP, REPEAT_VIT_PM)
+    n_out = tower.latency_log[-1]["left_tokens"] + 1
+    ratio = tower.latency_log[-1]["reduction_ratio"]
+    print(f"  PruMerge output: {n_out} tokens (ratio={ratio:.3f})", flush=True)
+
+    # Timed runs
+    tower.latency_log = []
+    total_times = []
+    for _ in range(REPEAT_VIT_PM):
+        sync()
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            tower(pv)
+        sync()
+        total_times.append((time.perf_counter() - t0) * 1000.0)
+
+    # Per-stage breakdown from latency_log
+    stage_keys = ["t_vit_ms", "t_attn_topk_ms", "t_merge_loop_ms"]
+    breakdown = {}
+    for k in stage_keys:
+        vals = [e[k] for e in tower.latency_log]
+        breakdown[k] = {"mean_ms": sum(vals)/len(vals),
+                        "std_ms": statistics.stdev(vals) if len(vals) > 1 else 0.0}
+
+    mean_total = sum(total_times) / len(total_times)
+    std_total  = statistics.stdev(total_times) if len(total_times) > 1 else 0.0
+
+    breakdown["t_quant_derived_ms"] = max(
+        mean_total
+        - breakdown["t_vit_ms"]["mean_ms"]
+        - breakdown["t_attn_topk_ms"]["mean_ms"]
+        - breakdown["t_merge_loop_ms"]["mean_ms"],
+        0.0
+    )
 
     return {
-        "mean_ms":   mean,
-        "std_ms":    std,
-        "n_out":     n_out,
-        "note":      "CLIPVisionTower.forward() (PruMerge_advanced + PruMerge_plus)",
-        "breakdown": {},
+        "mean_ms": mean_total, "std_ms": std_total,
+        "n_out": n_out, "reduction_ratio": ratio,
+        "breakdown": breakdown,
     }
 
 
 # ── T_quant ───────────────────────────────────────────────────────────────────
 
-def measure_t_quant(device: torch.device) -> dict[tuple, dict]:
+def measure_t_quant(device: torch.device) -> Dict[Tuple[int, int], Dict]:
     """
     Real MSECompressor.compress() + decompress() for each (N, bits).
     Input tensor shape: (1, 1, N, 1024)  — same as CLIPVisionTower uses.
@@ -203,7 +233,7 @@ def measure_t_quant(device: torch.device) -> dict[tuple, dict]:
         print(f"  [WARN] Cannot import MSECompressor: {e}")
         return {}
 
-    results: dict[tuple, dict] = {}
+    results: Dict[Tuple[int, int], Dict] = {}
     dev_str = "cuda" if torch.cuda.is_available() else "cpu"
 
     for bits in BIT_VALUES:
@@ -229,7 +259,7 @@ def calc_t_tx(n: int, bits: int, bandwidth_mbps: float) -> float:
     return n * TOKEN_DIM * bits / (bandwidth_mbps * 1_000_000) * 1000.0
 
 
-def build_t_tx_table() -> list[dict]:
+def build_t_tx_table() -> List[Dict]:
     rows = []
     for n in N_VALUES:
         for b in BIT_VALUES:
@@ -255,7 +285,7 @@ class FakeLLMPrefill(nn.Module):
         return self.layer(x)
 
 
-def measure_t_cloud(device: torch.device) -> dict[int, dict]:
+def measure_t_cloud(device: torch.device) -> Dict[int, Dict]:
     """
     Load LlavaLlamaForCausalLM from local LoRA checkpoint + Vicuna-7B base,
     then measure prefill latency by passing (1, N, 4096) inputs_embeds
@@ -291,7 +321,7 @@ def measure_t_cloud(device: torch.device) -> dict[int, dict]:
         print(f"  Falling back to FakeLLM.", flush=True)
         llava = FakeLLMPrefill().to(device).eval()
 
-    results: dict[int, dict] = {}
+    results: Dict[int, Dict] = {}
     for n in N_VALUES:
         dtype  = torch.float16 if not using_fake else torch.float32
         # Shape (1, N, 4096): simulate Projector output fed into LLM
