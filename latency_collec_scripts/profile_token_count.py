@@ -6,9 +6,12 @@ Directly uses CLIPVisionTower from clip_encoder.py to ensure consistency with ac
 Model is loaded in float16 on GPU to match inference conditions.
 
 Supported datasets:
-  pope      – 500 COCO natural scene images
-  mme       – 1187 images across 14 categories
-  textvqa   – 5000 text-heavy images
+  pope        – 500 COCO natural scene images
+  mme         – 1187 images across 14 categories
+  textvqa     – 5000 text-heavy images
+  vqav2       – VQAv2 val2014 images
+  scienceqa   – ScienceQA-IMG test split (image-only questions)
+  mmbench     – MMBench dev split (base64-encoded images)
 
 Usage:
     python profile_token_count.py --dataset pope --method both --max-images 500
@@ -16,7 +19,9 @@ Usage:
 """
 
 import argparse
+import base64
 import csv
+import io
 import json
 import statistics
 import sys
@@ -54,12 +59,64 @@ DATASET_CONFIGS = {
         "image_dir": Path("/mnt/ssd/yenhsiu_datasets/textvqa/train_images"),
         "img_field": "image",
     },
+    "vqav2": {
+        "jsonl":     Path("/home/yenhsiu/AdaptSplit-LMM/playground/data/eval/vqav2/llava_vqav2_mscoco_val2014.jsonl"),
+        "image_dir": Path("/mnt/ssd/yenhsiu_datasets/POPE/coco_val2014"),
+        "img_field": "image",
+    },
+    "scienceqa": {
+        "json":      Path("/home/yenhsiu/AdaptSplit-LMM/playground/data/eval/scienceqa/llava_test_CQM-A.json"),
+        "image_dir": Path("/home/yenhsiu/AdaptSplit-LMM/playground/data/eval/scienceqa/images/test"),
+    },
+    "mmbench": {
+        "tsv":       Path("/home/yenhsiu/AdaptSplit-LMM/playground/data/eval/mmbench/mmbench_dev_20230712.tsv"),
+    },
 }
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
-def load_unique_images(dataset: str, max_images: int) -> list[Path]:
+def load_unique_images(dataset: str, max_images):
+    """Return a list of Path objects (or PIL Images for mmbench)."""
     cfg = DATASET_CONFIGS[dataset]
+
+    if dataset == "scienceqa":
+        data = json.load(open(cfg["json"]))
+        paths, seen = [], set()
+        for item in data:
+            if "image" not in item:
+                continue
+            img_rel = item["image"]  # e.g. "5/image.png"
+            if img_rel in seen:
+                continue
+            seen.add(img_rel)
+            p = cfg["image_dir"] / img_rel
+            if p.exists():
+                paths.append(p)
+            if max_images and len(paths) >= max_images:
+                break
+        return paths
+
+    if dataset == "mmbench":
+        import csv as _csv
+        images = []
+        seen = set()
+        with open(cfg["tsv"]) as f:
+            reader = _csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                b64 = row["image"]
+                if b64 in seen:
+                    continue
+                seen.add(b64)
+                try:
+                    img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+                    images.append(img)
+                except Exception:
+                    pass
+                if max_images and len(images) >= max_images:
+                    break
+        return images
+
+    # Default: jsonl-based datasets (pope, mme, textvqa, vqav2)
     seen, paths = set(), []
     with open(cfg["jsonl"]) as f:
         for line in f:
@@ -69,7 +126,7 @@ def load_unique_images(dataset: str, max_images: int) -> list[Path]:
                 p = cfg["image_dir"] / fname
                 if p.exists():
                     paths.append(p)
-            if len(paths) >= max_images:
+            if max_images and len(paths) >= max_images:
                 break
     return paths
 
@@ -156,7 +213,7 @@ def run_method(vision_tower, processor, image_paths, method, device, debug=False
     results = []
     for i, img_path in enumerate(image_paths):
         try:
-            img = Image.open(img_path).convert("RGB")
+            img = img_path if isinstance(img_path, Image.Image) else Image.open(img_path).convert("RGB")
             pv  = processor(images=img, return_tensors="pt").pixel_values.to(device, dtype=torch.float16)
             r   = count_tokens(vision_tower, pv, method=method, debug=(debug and i == 0))
             results.append(r)
@@ -179,9 +236,9 @@ def save_csv(results, method, out_path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset",    choices=["pope", "mme", "textvqa"], default="pope")
+    parser.add_argument("--dataset",    choices=["pope", "mme", "textvqa", "vqav2", "scienceqa", "mmbench"], default="pope")
     parser.add_argument("--method",     choices=["advanced", "plus", "both"], default="both")
-    parser.add_argument("--max-images", type=int, default=500)
+    parser.add_argument("--max-images", type=int, default=None)
     parser.add_argument("--no-plot",    action="store_true")
     parser.add_argument("--debug",      action="store_true", help="Print debug info for first image")
     parser.add_argument("--clip-model", type=str, default=CLIP_MODEL_DEFAULT,
@@ -264,11 +321,10 @@ def main():
                            label=f"mean={statistics.mean(n_outs):.0f}")
                 ax.axvline(pct(n_outs, 95),         color="black", linestyle=":",
                            label=f"p95={pct(n_outs,95):.0f}")
-                ax.axvline(FULL_TOKENS, color="gray", linestyle="-", alpha=0.5,
-                           label=f"baseline={FULL_TOKENS}")
-                ax.set_xlabel("N_out (tokens after PruMerge)")
-                ax.set_ylabel("Image count")
-                ax.set_title(f"token_prune_merge_{method}  [{args.dataset}]")
+                ax.set_xlabel("Token Count")
+                ax.set_ylabel("Image Count")
+                method_label = "PruMerge+" if method == "plus" else "PruMerge"
+                ax.set_title(f"{method_label}  [{args.dataset}]")
                 ax.legend()
 
             plt.tight_layout()

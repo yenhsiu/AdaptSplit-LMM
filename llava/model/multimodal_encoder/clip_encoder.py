@@ -67,6 +67,7 @@ class CLIPVisionTower(nn.Module):
         self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
         self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name)
         self.vision_tower.requires_grad_(False)
+        self.compressor = MSECompressor(head_dim=1024, bits=2, seed=42, device="cuda")
 
         self.is_loaded = True
 
@@ -295,15 +296,17 @@ class CLIPVisionTower(nn.Module):
             # image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
             # image_features = self.feature_select(image_forward_outs).to(images.dtype)
 
-            image_features = self.token_prune_merge_advanced(images, if_adaptive=True, reduction_ratio=1/8)
+            # image_features = self.token_prune_merge_advanced(images, if_adaptive=True, reduction_ratio=1/8)
+            # print("after prune-merge, token num: ", image_features.size(1))
             
-            # image_features = self.token_prune_merge_advanced_plus(images, if_adaptive=True, reduction_ratio=1/8)
+            image_features = self.token_prune_merge_advanced_plus(images, if_adaptive=True, reduction_ratio=1/8)
+            # print("after prune-merge plus, token num: ", image_features.size(1))
 
-            # original_dtype = image_features.dtype
-            # tokens_4d = image_features.unsqueeze(1)
-            # compressed = self.compressor.compress(tokens_4d)
-            # reconstructed = self.compressor.decompress(compressed)
-            # image_features_q = reconstructed.squeeze(1).to(dtype=original_dtype)
+            original_dtype = image_features.dtype
+            tokens_4d = image_features.unsqueeze(1)
+            compressed = self.compressor.compress(tokens_4d)
+            reconstructed = self.compressor.decompress(compressed)
+            image_features = reconstructed.squeeze(1).to(dtype=original_dtype)
 
             # diff = (image_features_q.float() - image_features.float()).abs()
             # print(f"Max diff: {diff.max().item():.6f}, Mean diff: {diff.mean().item():.6f}")
