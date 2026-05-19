@@ -1,39 +1,46 @@
 #!/usr/bin/env python3
 """
-Cloud-side latency measurement.
-Measures: T_cloud(N) = Projector (MLP 1024→4096) + LLM prefill, sweeping N = 1..576
+measure_latency_prumerge.py — 手法②④ 用
+Sweeps N = 1..576 to measure Projector + LLM latency on a single device.
 
-Input pipeline per N:
-    torch.randn(1, N, 1024).half()  →  Projector  →  concat text(40 tokens)  →  LlamaModel
+For each N, injects random visual tokens [1, N, 1024] directly into the
+MLP Projector then concatenates text (40 tokens) and runs LlamaModel.
+ViT and PruMerge are NOT included (their timings come from measure_edge.py).
+
+This gives T_proj_llm(N) — the "after-PruMerge" portion of the pipeline
+for every token count, enabling full T_total reconstruction in result_analysis.
 
 Usage:
-    python measure_cloud.py [--device "RTX 3090"]              # default: step=8, 73 N values
-    python measure_cloud.py --n-step 1                         # all 576 N values (slow)
-    python measure_cloud.py --n-values 36 145 576              # specific N values only
+    python measure_latency_prumerge.py [--device "Jetson AGX Orin"]
+    python measure_latency_prumerge.py --n-step 8    # sample every 8th N (72 points, faster)
+    python measure_latency_prumerge.py --n-step 1    # all 576 values
 Output:
-    results_cloud_<device>.csv  (columns: component, N, mean_ms, std_ms)
+    results_latency_pm.csv  (columns: component, N, mean_ms, std_ms)
 """
 
 import argparse
 import csv
 import platform
 import statistics
+import sys
 import time
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
-VIT_DIM       = 1024
-PROJ_DIM      = 4096
-TEXT_TOKENS   = 40
-N_MIN         = 1
-N_MAX         = 576
-DEFAULT_N_STEP = 8    # default: 73 values; use --n-step 1 for all 576 (slow on LLM)
-WARMUP        = 10
-REPEAT_CLOUD  = 50
+TEXT_TOKENS = 40
+VIT_DIM     = 1024
+PROJ_DIM    = 4096
+N_MIN       = 1
+N_MAX       = 576
+DEFAULT_STEP = 8     # change to 1 for all 576 values (very slow on edge)
+WARMUP      = 5
+REPEAT      = 10
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -82,35 +89,30 @@ def build_projector(device):
         nn.GELU(),
         nn.Linear(PROJ_DIM, PROJ_DIM),
     ).to(device=device, dtype=torch.float16).eval()
+    print("  Built MLP Projector (1024→4096, random weights).", flush=True)
     return proj
 
-def build_llama_model(device):
-    """LlamaModel (Vicuna-7B architecture) with random weights."""
+def build_llm(device):
     from transformers import LlamaConfig, LlamaModel
     config = LlamaConfig(
-        hidden_size=4096,
-        intermediate_size=11008,
-        num_hidden_layers=32,
-        num_attention_heads=32,
-        num_key_value_heads=32,
-        max_position_embeddings=4096,
+        hidden_size=4096, intermediate_size=11008,
+        num_hidden_layers=32, num_attention_heads=32,
+        num_key_value_heads=32, max_position_embeddings=4096,
         vocab_size=32000,
     )
-    print("  Building LlamaModel (Vicuna-7B arch, random weights, float16) ...", flush=True)
-    model = LlamaModel(config).to(device=device, dtype=torch.float16).eval()
-    return model
+    print("  Building LlamaModel (Vicuna-7B arch, random weights) ...", flush=True)
+    return LlamaModel(config).to(device=device, dtype=torch.float16).eval()
 
-# ── T_cloud ───────────────────────────────────────────────────────────────────
+# ── Sweep measurement ─────────────────────────────────────────────────────────
 
-def measure_t_cloud(projector, llm, device, n_values):
+def sweep_n(projector, llm, device, n_values):
     """
-    For each N: time Projector + LLM prefill together.
-    Input:  vis_tokens [1, N, 1024]  →  proj [1, N, 4096]  +  text [1, 40, 4096]
-    Concat: [1, N+40, 4096]  →  LlamaModel
+    For each N: random [1, N, 1024] → Projector → concat text(40) → LLM
+    Returns dict {N: {"mean_ms": ..., "std_ms": ...}}
     """
     text_embeds = torch.randn(1, TEXT_TOKENS, PROJ_DIM, device=device, dtype=torch.float16)
     results = {}
-    total   = len(n_values)
+    total = len(n_values)
 
     for idx, n in enumerate(n_values):
         vis = torch.randn(1, n, VIT_DIM, device=device, dtype=torch.float16)
@@ -121,7 +123,7 @@ def measure_t_cloud(projector, llm, device, n_values):
                 inputs   = torch.cat([proj_out, text_embeds], dim=1)
                 llm(inputs_embeds=inputs, use_cache=False)
 
-        mean, std = timed_run(run, WARMUP, REPEAT_CLOUD)
+        mean, std = timed_run(run, WARMUP, REPEAT)
         results[n] = {"mean_ms": mean, "std_ms": std}
 
         if (idx + 1) % 10 == 0 or idx == 0 or idx == total - 1:
@@ -136,7 +138,7 @@ SEP = "═" * 62
 def hdr(title):
     print(f"\n{SEP}\n  {title}\n{SEP}")
 
-def print_results(device_name, sys_info, results):
+def print_results(device_name, sys_info, n_values, results):
     hdr("裝置資訊")
     print(f"  裝置    : {device_name}")
     print(f"  GPU     : {sys_info['gpu']}")
@@ -144,27 +146,22 @@ def print_results(device_name, sys_info, results):
     print(f"  RAM     : {sys_info['ram_gb']} GB")
     print(f"  PyTorch : {sys_info['torch']}")
 
-    measured_ns = sorted(results)
-    hdr(f"T_cloud  (Projector + LLM prefill, text={TEXT_TOKENS} tokens)  — summary")
-    print(f"  N range : {measured_ns[0]}..{measured_ns[-1]}  ({len(measured_ns)} values)")
-    landmarks = sorted(set(
-        [measured_ns[0]] + [n for n in [36, 145, 576] if n in results] + [measured_ns[-1]]
-    ))
-    print(f"  {'N':<6}  {'mean_ms':>10}  {'std_ms':>8}")
-    print(f"  {'─'*30}")
-    for n in landmarks:
+    hdr(f"T_proj_llm  (Projector + LLM, text={TEXT_TOKENS}, N={n_values[0]}..{n_values[-1]})")
+    print(f"  {'N':<6} {'mean_ms':>10} {'std_ms':>8}")
+    print(f"  {'─'*28}")
+    for n in n_values:
         d = results[n]
-        print(f"  N={n:<4}  {d['mean_ms']:>10.3f}  {d['std_ms']:>8.3f} ms")
-    print(f"\n  (full {len(measured_ns)} rows saved to CSV)")
+        print(f"  {n:<6} {d['mean_ms']:>10.3f} {d['std_ms']:>8.3f} ms")
+    print()
 
-def export_csv(device_name, results):
+def export_csv(device_name, n_values, results):
     safe  = device_name.replace(" ", "_").replace("/", "-")
-    fname = str(Path(__file__).resolve().parent / f"results_cloud_{safe}.csv")
+    fname = str(Path(__file__).resolve().parent / f"results_latency_pm_{safe}.csv")
     fields = ["component", "N", "mean_ms", "std_ms"]
     rows = [
-        {"component": "T_cloud", "N": n,
+        {"component": "T_proj_llm", "N": n,
          "mean_ms": results[n]["mean_ms"], "std_ms": results[n]["std_ms"]}
-        for n in sorted(results)
+        for n in n_values
     ]
     with open(fname, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -175,16 +172,19 @@ def export_csv(device_name, results):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Cloud Latency Measurement")
-    parser.add_argument("--device", type=str, default="Unknown GPU")
-    parser.add_argument("--n-step", type=int, default=DEFAULT_N_STEP,
-                        help=f"Token count step (default {DEFAULT_N_STEP}). Use 1 for all 576 values.")
+    parser = argparse.ArgumentParser(
+        description="Projector + LLM latency sweep over N visual tokens")
+    parser.add_argument("--device", type=str, default="Unknown Device",
+                        help='Label, e.g. "Jetson AGX Orin"')
+    parser.add_argument("--n-step", type=int, default=DEFAULT_STEP,
+                        help=f"Token count step size (default {DEFAULT_STEP}). "
+                             f"Use 1 for all {N_MAX} values (very slow on edge).")
     parser.add_argument("--n-values", type=int, nargs="+", default=None,
-                        help="Explicit N values to test (overrides --n-step)")
+                        help="Explicit list of N values to test (overrides --n-step)")
     args = parser.parse_args()
 
     if args.n_values:
-        n_values = sorted(set(n for n in args.n_values if N_MIN <= n <= N_MAX))
+        n_values = sorted(set(max(1, n) for n in args.n_values if 1 <= n <= N_MAX))
     else:
         n_values = list(range(N_MIN, N_MAX + 1, args.n_step))
         if N_MAX not in n_values:
@@ -194,24 +194,25 @@ def main():
     sys_info = detect_system_info()
 
     print(SEP)
-    print("  Cloud Latency Measurement  →  results_cloud_<device>.csv")
+    print("  measure_latency_prumerge.py  →  results_latency_pm.csv")
     print(SEP)
     print(f"  Device  : {args.device}  |  Torch: {device}  |  GPU: {sys_info['gpu']}")
     print(f"  N range : {n_values[0]}..{n_values[-1]}  ({len(n_values)} values, step={args.n_step})")
+    print(f"  Per N   : warmup={WARMUP}, repeat={REPEAT}")
 
-    print("\n[1/3] Building Projector (MLP 1024→4096) ...")
+    print("\n[1/3] Building Projector ...")
     projector = build_projector(device)
 
-    print("\n[2/3] Building LlamaModel (Vicuna-7B arch, random weights) ...")
-    llm = build_llama_model(device)
+    print("\n[2/3] Building LLM ...")
+    llm = build_llm(device)
 
-    print(f"\n[3/3] Measuring T_cloud  (warmup={WARMUP}, repeat={REPEAT_CLOUD} per N) ...")
-    results = measure_t_cloud(projector, llm, device, n_values)
+    print(f"\n[3/3] Sweeping N = {n_values[0]}..{n_values[-1]} ...")
+    results = sweep_n(projector, llm, device, n_values)
 
-    print_results(args.device, sys_info, results)
+    print_results(args.device, sys_info, n_values, results)
 
     hdr("CSV Output")
-    export_csv(args.device, results)
+    export_csv(args.device, n_values, results)
 
 if __name__ == "__main__":
     main()
