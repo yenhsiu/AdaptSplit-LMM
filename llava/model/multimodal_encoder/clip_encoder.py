@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -67,7 +68,13 @@ class CLIPVisionTower(nn.Module):
         self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
         self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name)
         self.vision_tower.requires_grad_(False)
-        self.compressor = MSECompressor(head_dim=1024, bits=2, seed=42, device="cuda")
+
+        use_quant = os.environ.get('LLAVA_USE_QUANT', 'false').lower() == 'true'
+        if use_quant:
+            quant_bits = int(os.environ.get('LLAVA_QUANT_BITS', '2'))
+            self.compressor = MSECompressor(head_dim=1024, bits=quant_bits, seed=42, device="cuda")
+        else:
+            self.compressor = None
 
         self.is_loaded = True
 
@@ -293,24 +300,26 @@ class CLIPVisionTower(nn.Module):
                 image_feature = self.feature_select(image_forward_out).to(image.dtype)
                 image_features.append(image_feature)
         else:
-            # image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
-            # image_features = self.feature_select(image_forward_outs).to(images.dtype)
+            token_method = os.environ.get('LLAVA_TOKEN_METHOD', 'original')
 
-            # image_features = self.token_prune_merge_advanced(images, if_adaptive=True, reduction_ratio=1/8)
-            # print("after prune-merge, token num: ", image_features.size(1))
-            
-            image_features = self.token_prune_merge_advanced_plus(images, if_adaptive=True, reduction_ratio=1/8)
-            # print("after prune-merge plus, token num: ", image_features.size(1))
+            if token_method == 'prumerge':
+                image_features = self.token_prune_merge_advanced(images, if_adaptive=True, reduction_ratio=1/8)
+            elif token_method == 'prumerge_plus':
+                image_features = self.token_prune_merge_advanced_plus(images, if_adaptive=True, reduction_ratio=1/8)
+            else:
+                image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
+                image_features = self.feature_select(image_forward_outs).to(images.dtype)
 
-            original_dtype = image_features.dtype
-            tokens_4d = image_features.unsqueeze(1)
-            compressed = self.compressor.compress(tokens_4d)
-            reconstructed = self.compressor.decompress(compressed)
-            image_features = reconstructed.squeeze(1).to(dtype=original_dtype)
+            if self.compressor is not None:
+                original_dtype = image_features.dtype
+                compressed = self.compressor.compress(image_features.unsqueeze(1))
+                reconstructed = self.compressor.decompress(compressed)
+                image_features = reconstructed.squeeze(1).to(dtype=original_dtype)
 
-            # diff = (image_features_q.float() - image_features.float()).abs()
-            # print(f"Max diff: {diff.max().item():.6f}, Mean diff: {diff.mean().item():.6f}")
-            # exit()
+                # diff = (image_features_q.float() - image_features.float()).abs()
+                # print(f"Max diff: {diff.max().item():.6f}, Mean diff: {diff.mean().item():.6f}")
+                # exit()
+
 
         return image_features
 
