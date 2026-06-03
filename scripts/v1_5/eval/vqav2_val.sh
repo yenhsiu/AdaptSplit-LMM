@@ -4,10 +4,10 @@ PYTHON=/mnt/ssd/yenhsiu_envs/llava_eval/bin/python
 # ============================================================
 # Configuration — only change this section
 # ============================================================
-CUDA=0
+CUDA=1
 METHOD=prumerge_plus          # original | prumerge | prumerge_plus
 USE_QUANT=true          # true | false
-QUANT_BITS=1           # 1 |2 | 4 | 
+QUANT_BITS=1             # 1| 2 | 4 
 # ============================================================
 
 # Auto model path mapping
@@ -38,30 +38,34 @@ export LLAVA_TOKEN_METHOD=$METHOD
 export LLAVA_USE_QUANT=$USE_QUANT
 export LLAVA_QUANT_BITS=$QUANT_BITS
 
-echo "=== MME Evaluation ==="
+echo "=== VQAv2 Val Evaluation ==="
 echo "Method:     $METHOD"
 echo "Quant:      $USE_QUANT (${QUANT_BITS}bit)"
 echo "CUDA:       $CUDA"
 echo "Exp name:   $EXP_NAME"
 echo "Model path: $MODEL_PATH"
-echo "======================"
+echo "============================"
 
-ANSWERS_FILE=./playground/data/eval/MME/answers/${EXP_NAME}.jsonl
+SPLIT="llava_vqav2_mscoco_val2014"
+ANSWERS_DIR=./playground/data/eval/vqav2/answers/$SPLIT
+ANSWERS_FILE=$ANSWERS_DIR/${EXP_NAME}.jsonl
+
+mkdir -p "$ANSWERS_DIR"
 
 if [ -n "$MODEL_BASE" ]; then
     $PYTHON -m llava.eval.model_vqa_loader \
         --model-path "$MODEL_PATH" \
         --model-base "$MODEL_BASE" \
-        --question-file ./playground/data/eval/MME/llava_mme.jsonl \
-        --image-folder ./playground/data/eval/MME/MME_Benchmark_release_version \
+        --question-file ./playground/data/eval/vqav2/${SPLIT}.jsonl \
+        --image-folder /mnt/ssd/yenhsiu_datasets/POPE/coco_val2014 \
         --answers-file "$ANSWERS_FILE" \
         --temperature 0 \
         --conv-mode vicuna_v1
 else
     $PYTHON -m llava.eval.model_vqa_loader \
         --model-path "$MODEL_PATH" \
-        --question-file ./playground/data/eval/MME/llava_mme.jsonl \
-        --image-folder ./playground/data/eval/MME/MME_Benchmark_release_version \
+        --question-file ./playground/data/eval/vqav2/${SPLIT}.jsonl \
+        --image-folder /mnt/ssd/yenhsiu_datasets/POPE/coco_val2014 \
         --answers-file "$ANSWERS_FILE" \
         --temperature 0 \
         --conv-mode vicuna_v1
@@ -74,7 +78,7 @@ fi
 
 # Save config
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
-CONFIG_FILE="./playground/data/eval/MME/answers/${EXP_NAME}_config.json"
+CONFIG_FILE="$ANSWERS_DIR/${EXP_NAME}_config.json"
 cat > "$CONFIG_FILE" << EOF
 {
   "exp_name": "$EXP_NAME",
@@ -87,10 +91,7 @@ cat > "$CONFIG_FILE" << EOF
 }
 EOF
 
-cd ./playground/data/eval/MME
-
-$PYTHON convert_answer_to_mme.py --experiment "$EXP_NAME"
-
-cd eval_tool
-
-$PYTHON calculation.py --results_dir "answers/${EXP_NAME}" | tee "../answers/${EXP_NAME}_results.txt"
+$PYTHON llava/eval/eval_vqav2.py \
+    --annotation-file /mnt/ssd/yenhsiu_datasets/vqav2/v2_mscoco_val2014_annotations.json \
+    --result-file "$ANSWERS_FILE" \
+    | tee "$ANSWERS_DIR/${EXP_NAME}_results.txt"

@@ -36,4 +36,5 @@ playground/data/eval/
 PRUMERGE_METHOD=*
 
 *.pyc
+*.png
 

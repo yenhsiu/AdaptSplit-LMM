@@ -4,10 +4,10 @@ PYTHON=/mnt/ssd/yenhsiu_envs/llava_eval/bin/python
 # ============================================================
 # Configuration — only change this section
 # ============================================================
-CUDA=0
+CUDA=2
 METHOD=original          # original | prumerge | prumerge_plus
-USE_QUANT=false          # true | false
-QUANT_BITS=4             # 2 | 4 | 8
+USE_QUANT=true          # true | false
+QUANT_BITS=1             # 1 | 2 | 4 
 # ============================================================
 
 # Auto model path mapping
