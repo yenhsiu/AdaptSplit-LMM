@@ -8,7 +8,7 @@ from transformers import CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig
 import matplotlib.pyplot as plt
 import numpy as np
 import json
-from turboquant.compressors_v3 import MSECompressor
+from turboquant.compressors_v3 import MSECompressor, StratifiedCompressor
 
 def complement_idx(idx, dim):
     a = torch.arange(dim, device=idx.device)
@@ -71,10 +71,18 @@ class CLIPVisionTower(nn.Module):
 
         use_quant = os.environ.get('LLAVA_USE_QUANT', 'false').lower() == 'true'
         if use_quant:
-            quant_bits = int(os.environ.get('LLAVA_QUANT_BITS', '2'))
-            self.compressor = MSECompressor(head_dim=1024, bits=quant_bits, seed=42, device="cuda")
+            quant_mode = os.environ.get('LLAVA_QUANT_MODE', 'uniform')
+            if quant_mode == 'stratified':
+                groups_str = os.environ.get('LLAVA_STRAT_GROUPS', '40:4,40:2,20:1')
+                groups = [(int(n), int(b)) for n, b in (g.split(':') for g in groups_str.split(','))]
+                self.compressor = StratifiedCompressor(head_dim=1024, groups=groups, seed=42, device="cuda")
+            else:
+                quant_bits = int(os.environ.get('LLAVA_QUANT_BITS', '2'))
+                self.compressor = MSECompressor(head_dim=1024, bits=quant_bits, seed=42, device="cuda")
+            self.quant_mode = quant_mode
         else:
             self.compressor = None
+            self.quant_mode = None
 
         self.is_loaded = True
 
@@ -89,6 +97,34 @@ class CLIPVisionTower(nn.Module):
         return image_features
 
 
+
+    def token_prune_select(self, images):
+        """
+        Select top-N tokens by CLS attention score, no merging.
+        Returns tokens sorted by attention (desc) for stratified quantization.
+        """
+        hook_handle_k = self.vision_tower.vision_model.encoder.layers[23].self_attn.k_proj.register_forward_hook(hook_k)
+        hook_handle_q = self.vision_tower.vision_model.encoder.layers[23].self_attn.q_proj.register_forward_hook(hook_q)
+
+        image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
+        image_features = self.feature_select(image_forward_outs).to(images.dtype)
+        C = image_features.shape[2]
+
+        desired_layer_k = outputs["desired_k"]
+        desired_layer_q = outputs["desired_q"]
+        hook_handle_k.remove()
+        hook_handle_q.remove()
+
+        attn = (desired_layer_q @ desired_layer_k.transpose(-2, -1)) * C ** -0.5
+        attn = F.softmax(attn, dim=-1)
+        cls_attn = attn[:, 0, 1:]  # [B, N]
+
+        n_tokens = int(os.environ.get('LLAVA_N_TOKENS', '65'))
+        # topk returns indices sorted by value (largest first) — used directly for stratified grouping
+        _, top_idx = torch.topk(cls_attn, n_tokens, dim=1, largest=True)
+        index = top_idx.unsqueeze(-1).expand(-1, -1, C)
+        selected = torch.gather(image_features, dim=1, index=index)  # [B, n_tokens, C]
+        return selected
 
     def token_prune_merge_advanced(self, images, if_adaptive=True, reduction_ratio = 1/8):
         '''
@@ -306,15 +342,20 @@ class CLIPVisionTower(nn.Module):
                 image_features = self.token_prune_merge_advanced(images, if_adaptive=True, reduction_ratio=1/8)
             elif token_method == 'prumerge_plus':
                 image_features = self.token_prune_merge_advanced_plus(images, if_adaptive=True, reduction_ratio=1/8)
+            elif token_method == 'prumerge_quant':
+                image_features = self.token_prune_select(images)
             else:
                 image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
                 image_features = self.feature_select(image_forward_outs).to(images.dtype)
 
             if self.compressor is not None:
                 original_dtype = image_features.dtype
-                compressed = self.compressor.compress(image_features.unsqueeze(1))
-                reconstructed = self.compressor.decompress(compressed)
-                image_features = reconstructed.squeeze(1).to(dtype=original_dtype)
+                if self.quant_mode == 'stratified':
+                    image_features = self.compressor.compress_decompress(image_features).to(dtype=original_dtype)
+                else:
+                    compressed = self.compressor.compress(image_features.unsqueeze(1))
+                    reconstructed = self.compressor.decompress(compressed)
+                    image_features = reconstructed.squeeze(1).to(dtype=original_dtype)
 
                 # diff = (image_features_q.float() - image_features.float()).abs()
                 # print(f"Max diff: {diff.max().item():.6f}, Mean diff: {diff.mean().item():.6f}")

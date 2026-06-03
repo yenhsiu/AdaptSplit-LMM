@@ -120,6 +120,38 @@ class MSECompressor:
         }
 
 
+class StratifiedCompressor:
+    """
+    Apply different bit widths to token groups based on CLS attention rank.
+    Expects features pre-sorted by attention score (descending).
+    groups: list of (n_tokens, bits) from highest to lowest attention rank.
+    """
+
+    def __init__(self, head_dim: int, groups, seed: int = 42, device: str = "cpu"):
+        self.groups = groups  # [(n1, b1), (n2, b2), ...]
+        unique_bits = {b for _, b in groups}
+        self.compressors = {
+            b: MSECompressor(head_dim, b, seed, device)
+            for b in unique_bits
+        }
+
+    @torch.no_grad()
+    def compress_decompress(self, features_sorted: torch.Tensor) -> torch.Tensor:
+        """
+        features_sorted: [B, N, D], tokens sorted by CLS attention (desc).
+        Returns: [B, N, D] reconstructed in the same order.
+        """
+        result = torch.zeros_like(features_sorted, dtype=torch.float32)
+        offset = 0
+        for n_tok, bits in self.groups:
+            group = features_sorted[:, offset:offset + n_tok, :].float()
+            comp = self.compressors[bits].compress(group.unsqueeze(1))
+            recon = self.compressors[bits].decompress(comp).squeeze(1)
+            result[:, offset:offset + n_tok, :] = recon
+            offset += n_tok
+        return result
+
+
 class TurboQuantV3:
     """
     Community-informed KV cache compressor.
