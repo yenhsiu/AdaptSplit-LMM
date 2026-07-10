@@ -62,15 +62,18 @@ MME_DIR     = PROJECT_ROOT / "playground/data/eval/MME"
 # ── Evaluation via validate.py subprocess ────────────────────────────────────
 
 def run_eval(dataset: str, n4: int, n2: int, n1: int, exp_name: str, cuda: str,
-             split: str = "search", split_ratio: float = 0.3) -> float:
+             split: str = "search", split_ratio: float = 0.3, merge: bool = False) -> float:
     """Run validate.py for (n4, n2, n1) and parse the scalar score."""
+    cmd = [PYTHON, str(VALIDATE_PY),
+           "--dataset", dataset,
+           "--n4", str(n4), "--n2", str(n2), "--n1", str(n1),
+           "--split", split, "--split-ratio", str(split_ratio),
+           "--cuda", cuda,
+           "--no-save"]
+    if merge:
+        cmd.append("--merge")
     result = subprocess.run(
-        [PYTHON, str(VALIDATE_PY),
-         "--dataset", dataset,
-         "--n4", str(n4), "--n2", str(n2), "--n1", str(n1),
-         "--split", split, "--split-ratio", str(split_ratio),
-         "--cuda", cuda,
-         "--no-save"],
+        cmd,
         cwd=str(PROJECT_ROOT),
         capture_output=True, text=True,
     )
@@ -111,10 +114,11 @@ def is_feasible(n4: int, n2: int, n1: int) -> bool:
     return n1 >= 0 and N > 0 and N <= 576
 
 
-def search(dataset: str, S: int, n_trials: int, cuda: str, split_ratio: float = 0.3) -> dict:
+
+def search(dataset: str, S: int, n_trials: int, cuda: str, split_ratio: float = 0.3, merge: bool = False, seed: int = 42) -> dict:
     study = optuna.create_study(
         direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=42),
+        sampler=optuna.samplers.TPESampler(seed=seed),
     )
     trial_count = 0
     while trial_count < n_trials:
@@ -129,7 +133,7 @@ def search(dataset: str, S: int, n_trials: int, cuda: str, split_ratio: float = 
         print(f"\n  trial {trial_count:3d}: n4={n4:3d}, n2={n2:3d}, n1={n1:3d}, "
               f"N={n4+n2+n1:3d}  →  {exp_name}")
 
-        score = run_eval(dataset, n4, n2, n1, exp_name, cuda, split="all", split_ratio=split_ratio)
+        score = run_eval(dataset, n4, n2, n1, exp_name, cuda, split="all", split_ratio=split_ratio, merge=merge)
         print(f"           score = {score:.4f}")
 
         study.tell(trial, score)
@@ -170,12 +174,16 @@ def main():
     parser.add_argument("--cuda",        default="0")
     parser.add_argument("--output",      default=None,
                         help="Path to save results JSON (default: results/search_<dataset>_<timestamp>.json)")
+    parser.add_argument("--merge", action="store_true",
+                        help="Use prune+merge token selection instead of prune-only")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for Optuna TPE sampler (default: 42)")
     args = parser.parse_args()
 
     results = []
     for S in args.budgets:
         print(f"\n{'='*40}\nDataset: {args.dataset}  Budget: {S}\n{'='*40}")
-        results.append(search(args.dataset, S, args.n_trials, args.cuda, args.split_ratio))
+        results.append(search(args.dataset, S, args.n_trials, args.cuda, args.split_ratio, merge=args.merge, seed=args.seed))
 
     print("\n\n=== Search Summary ===")
     import pandas as pd

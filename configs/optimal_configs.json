@@ -1,0 +1,21 @@
+{
+  "comment": "MME-optimized (n4, n2, n1) configurations per budget. Searched via Optuna TPE, 200 trials.",
+  "baseline": {
+    "n_tokens": 576,
+    "no_quant": true,
+    "mme_score": 1861.4314
+  },
+  "budgets": {
+    "25600":  {"n4": 0,  "n2": 2,  "n1": 21,  "N": 23,  "top_ratio": 0.000, "mme_score": 1429.01, "vs_baseline": -23.2},
+    "32000":  {"n4": 0,  "n2": 3,  "n1": 25,  "N": 28,  "top_ratio": 0.000, "mme_score": 1460.17, "vs_baseline": -21.6},
+    "51200":  {"n4": 0,  "n2": 12, "n1": 26,  "N": 38,  "top_ratio": 0.000, "mme_score": 1545.49, "vs_baseline": -16.9},
+    "75000":  {"n4": 2,  "n2": 11, "n1": 33,  "N": 46,  "top_ratio": 0.043, "mme_score": 1566.90, "vs_baseline": -15.8},
+    "115500": {"n4": 4,  "n2": 33, "n1": 27,  "N": 64,  "top_ratio": 0.062, "mme_score": 1585.77, "vs_baseline": -14.8},
+    "150000": {"n4": 3,  "n2": 33, "n1": 49,  "N": 85,  "top_ratio": 0.035, "mme_score": 1608.22, "vs_baseline": -13.6},
+    "200000": {"n4": 6,  "n2": 31, "n1": 82,  "N": 119, "top_ratio": 0.050, "mme_score": 1620.74, "vs_baseline": -12.9},
+    "266240": {"n4": 11, "n2": 5,  "n1": 191, "N": 207, "top_ratio": 0.053, "mme_score": 1683.43, "vs_baseline": -9.6},
+    "350000": {"n4": 3,  "n2": 26, "n1": 277, "N": 306, "top_ratio": 0.010, "mme_score": 1779.01, "vs_baseline": -4.4},
+    "450000": {"n4": 0,  "n2": 25, "n1": 369, "N": 394, "top_ratio": 0.000, "mme_score": 1813.95, "vs_baseline": -2.6},
+    "589824": {"n4": 13, "n2": 28, "n1": 461, "N": 502, "top_ratio": 0.026, "mme_score": 1873.44, "vs_baseline": 0.6}
+  }
+}

@@ -30,7 +30,9 @@ SPLIT_SEED = 42
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
 PYTHON       = "/mnt/ssd/yenhsiu_envs/llava_eval/bin/python"
-MODEL_PATH   = "/mnt/ssd/yuzhang_models/llava-v1.5-7b"
+MODEL_PATH        = "/mnt/ssd/yuzhang_models/llava-v1.5-7b"
+LORA_MODEL_PATH   = "/mnt/ssd/yuzhang_models/llava-prumerge-vicuna-7b-v1.5-lora"
+LORA_MODEL_BASE   = "lmsys/vicuna-7b-v1.5"
 CONFIGS_PATH = PROJECT_ROOT / "configs" / "optimal_configs.json"
 RESULTS_DIR  = PROJECT_ROOT / "results"
 
@@ -98,6 +100,9 @@ def parse_args():
                         help="Fraction of data used as search set (default: 0.3)")
     parser.add_argument("--no-save", action="store_true",
                         help="Skip saving results to txt file (used during search)")
+
+    parser.add_argument("--merge", action="store_true",
+                        help="Use prumerge_quant_merge (prune + merge) instead of prune-only")
 
     # Mode flags
     parser.add_argument("--baseline",  action="store_true")
@@ -220,15 +225,16 @@ def get_split_question_file(dataset_cfg: dict, split: str, ratio: float) -> Path
 
 # ── Env builder ───────────────────────────────────────────────────────────────
 
-def build_env(n4: int, n2: int, n1: int, use_quant: bool, cuda: str) -> dict:
+def build_env(n4: int, n2: int, n1: int, use_quant: bool, cuda: str, merge: bool = False) -> dict:
     N = n4 + n2 + n1
+    token_method = "prumerge_quant_merge" if merge else "prumerge_quant"
 
     if not use_quant:
         return {
             **os.environ,
             "CUDA_VISIBLE_DEVICES":  cuda,
             "HF_HOME":               "/mnt/ssd/yenhsiu_hf_cache",
-            "LLAVA_TOKEN_METHOD":    "prumerge_quant",
+            "LLAVA_TOKEN_METHOD":    token_method,
             "LLAVA_USE_QUANT":       "false",
             "LLAVA_N_TOKENS":        str(N),
         }
@@ -247,7 +253,7 @@ def build_env(n4: int, n2: int, n1: int, use_quant: bool, cuda: str) -> dict:
         **os.environ,
         "CUDA_VISIBLE_DEVICES":  cuda,
         "HF_HOME":               "/mnt/ssd/yenhsiu_hf_cache",
-        "LLAVA_TOKEN_METHOD":    "prumerge_quant",
+        "LLAVA_TOKEN_METHOD":    token_method,
         "LLAVA_USE_QUANT":       "true",
         "LLAVA_QUANT_MODE":      quant_mode,
         "LLAVA_N_TOKENS":        str(N),
@@ -346,7 +352,7 @@ def main():
     split_tag    = f"_{args.split}" if args.split != "all" else ""
     exp_name     = f"validate_{args.dataset}{split_tag}_{mode_tag}"
     answers_file = PROJECT_ROOT / dataset_cfg["answers_dir"] / f"{exp_name}.jsonl"
-    env          = build_env(n4, n2, n1, use_quant, args.cuda)
+    env          = build_env(n4, n2, n1, use_quant, args.cuda, merge=args.merge)
 
     question_file = get_split_question_file(dataset_cfg, args.split, args.split_ratio)
 
@@ -359,8 +365,13 @@ def main():
 
     # ── Inference ──
     inference_module = dataset_cfg.get("inference_module", "llava.eval.model_vqa_loader")
+    if args.merge:
+        model_args = ["--model-path", LORA_MODEL_PATH, "--model-base", LORA_MODEL_BASE]
+    else:
+        model_args = ["--model-path", MODEL_PATH]
+
     cmd = [PYTHON, "-m", inference_module,
-           "--model-path",    MODEL_PATH,
+           *model_args,
            "--question-file", str(question_file),
            "--answers-file",  str(answers_file),
            "--temperature",   "0",

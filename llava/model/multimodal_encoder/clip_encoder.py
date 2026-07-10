@@ -97,6 +97,14 @@ class CLIPVisionTower(nn.Module):
         return image_features
 
 
+    @staticmethod
+    def _n_tokens_from_env() -> int:
+        """Compute N = sum of n values from LLAVA_STRAT_GROUPS, fallback to LLAVA_N_TOKENS."""
+        strat = os.environ.get('LLAVA_STRAT_GROUPS', '')
+        if strat:
+            return sum(int(g.split(':')[0]) for g in strat.split(',') if g)
+        return int(os.environ.get('LLAVA_N_TOKENS', '65'))
+
 
     def token_prune_select(self, images):
         """
@@ -119,12 +127,93 @@ class CLIPVisionTower(nn.Module):
         attn = F.softmax(attn, dim=-1)
         cls_attn = attn[:, 0, 1:]  # [B, N]
 
-        n_tokens = int(os.environ.get('LLAVA_N_TOKENS', '65'))
+        n_tokens = self._n_tokens_from_env()
         # topk returns indices sorted by value (largest first) — used directly for stratified grouping
         _, top_idx = torch.topk(cls_attn, n_tokens, dim=1, largest=True)
         index = top_idx.unsqueeze(-1).expand(-1, -1, C)
         selected = torch.gather(image_features, dim=1, index=index)  # [B, n_tokens, C]
         return selected
+
+    def token_prune_merge_select(self, images):
+        """
+        Prune + Merge + Sort for stratified quantization.
+        Same merge logic as token_prune_merge_advanced (PruMerge paper),
+        but with fixed N = LLAVA_N_TOKENS and output sorted by attention for stratified quant.
+        """
+        hook_handle_k = self.vision_tower.vision_model.encoder.layers[23].self_attn.k_proj.register_forward_hook(hook_k)
+        hook_handle_q = self.vision_tower.vision_model.encoder.layers[23].self_attn.q_proj.register_forward_hook(hook_q)
+
+        image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
+        image_features = self.feature_select(image_forward_outs).to(images.dtype)
+        B, N_total, C = image_features.shape  # N_total = 576
+
+        desired_layer_k = outputs["desired_k"]
+        desired_layer_q = outputs["desired_q"]
+        hook_handle_k.remove()
+        hook_handle_q.remove()
+
+        attn = (desired_layer_q @ desired_layer_k.transpose(-2, -1)) * C ** -0.5
+        attn = F.softmax(attn, dim=-1)
+        cls_attn = attn[:, 0, 1:]  # [B, 576]
+
+        n_tokens = self._n_tokens_from_env()
+
+        # top-N tokens (sorted by attention descending — order matters for stratified quant)
+        _, top_idx = torch.topk(cls_attn, n_tokens, dim=1, largest=True, sorted=True)
+        index = top_idx.unsqueeze(-1).expand(-1, -1, C)
+
+        x_others = torch.gather(image_features, dim=1, index=index)          # [B, N, C]
+        x_others_attn = torch.gather(cls_attn, dim=1, index=top_idx)         # [B, N]
+
+        compl = complement_idx(top_idx, N_total)                              # [B, 576-N]
+        non_topk = torch.gather(image_features, dim=1,
+                                index=compl.unsqueeze(-1).expand(-1, -1, C)) # [B, 576-N, C]
+        non_topk_attn = torch.gather(cls_attn, dim=1, index=compl)           # [B, 576-N]
+
+        Key_wo_cls = desired_layer_k[:, 1:]  # [B, 576, C]
+        Key_others = torch.gather(Key_wo_cls, dim=1, index=index)            # [B, N, C]
+        non_topk_Key = torch.gather(Key_wo_cls, dim=1,
+                                    index=compl.unsqueeze(-1).expand(-1, -1, C))  # [B, 576-N, C]
+
+        Key_others_norm = F.normalize(Key_others, p=2, dim=-1)
+        non_topk_Key_norm = F.normalize(non_topk_Key, p=2, dim=-1)
+
+        # same as original: for each top token, find k=32 most similar tokens
+        # from all other tokens (other top + non-top), weighted sum + self
+        updated_x_others = torch.zeros_like(x_others)
+        left_tokens = n_tokens
+
+        for b in range(B):
+            for i in range(left_tokens):
+                key_i_norm = Key_others_norm[b, i, :].unsqueeze(0).unsqueeze(0)
+
+                before_i_Key = Key_others_norm[b, :i, :].unsqueeze(0)
+                after_i_Key  = Key_others_norm[b, i+1:, :].unsqueeze(0)
+                before_i_x   = x_others[b, :i, :].unsqueeze(0)
+                after_i_x    = x_others[b, i+1:, :].unsqueeze(0)
+                before_i_attn = x_others_attn[b, :i].unsqueeze(0)
+                after_i_attn  = x_others_attn[b, i+1:].unsqueeze(0)
+
+                rest_keys  = torch.cat([before_i_Key, after_i_Key,
+                                        non_topk_Key_norm[b, :, :].unsqueeze(0)], dim=1)
+                rest_x     = torch.cat([before_i_x, after_i_x,
+                                        non_topk[b, :, :].unsqueeze(0)], dim=1)
+                rest_attn  = torch.cat([before_i_attn, after_i_attn,
+                                        non_topk_attn[b, :].unsqueeze(0)], dim=1)
+
+                cos_sim = torch.bmm(key_i_norm, rest_keys.transpose(1, 2))
+                k = min(n_tokens, rest_keys.shape[1])
+                _, cluster_indices = torch.topk(cos_sim, k=k, dim=2, largest=True)
+
+                cluster_indices_flat = cluster_indices.view(-1)
+                cluster_tokens = rest_x[:, cluster_indices_flat, :]
+                weights = rest_attn[:, cluster_indices_flat].unsqueeze(-1)
+
+                weighted_avg = torch.sum(cluster_tokens * weights, dim=1)
+                updated_x_others[b, i, :] = weighted_avg + x_others[b, i, :]
+
+        # already sorted by attention (topk with sorted=True), preserve order
+        return updated_x_others  # [B, N, C]
 
     def token_prune_merge_advanced(self, images, if_adaptive=True, reduction_ratio = 1/8):
         '''
@@ -325,7 +414,6 @@ class CLIPVisionTower(nn.Module):
         return image_features
 
     
-
  
     @torch.no_grad()
     def forward(self, images):
@@ -344,6 +432,8 @@ class CLIPVisionTower(nn.Module):
                 image_features = self.token_prune_merge_advanced_plus(images, if_adaptive=True, reduction_ratio=1/8)
             elif token_method == 'prumerge_quant':
                 image_features = self.token_prune_select(images)
+            elif token_method == 'prumerge_quant_merge':
+                image_features = self.token_prune_merge_select(images)
             else:
                 image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
                 image_features = self.feature_select(image_forward_outs).to(images.dtype)

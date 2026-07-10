@@ -21,8 +21,9 @@ import sys
 import json
 import argparse
 import subprocess
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
+
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
 PYTHON       = "/mnt/ssd/yenhsiu_envs/llava_eval/bin/python"
@@ -54,13 +55,16 @@ PARSERS = {
 
 # ── Validation runner ─────────────────────────────────────────────────────────
 
-def run_validate(dataset: str, n4: int, n2: int, n1: int, cuda: str) -> str:
+def run_validate(dataset: str, n4: int, n2: int, n1: int, cuda: str, merge: bool = False) -> str:
+    cmd = [PYTHON, str(VALIDATE_PY),
+           "--dataset", dataset,
+           "--n4", str(n4), "--n2", str(n2), "--n1", str(n1),
+           "--split", "all",
+           "--cuda", cuda]
+    if merge:
+        cmd.append("--merge")
     result = subprocess.run(
-        [PYTHON, str(VALIDATE_PY),
-         "--dataset", dataset,
-         "--n4", str(n4), "--n2", str(n2), "--n1", str(n1),
-         "--split", "all",
-         "--cuda", cuda],
+        cmd,
         cwd=str(PROJECT_ROOT),
         capture_output=True, text=True,
     )
@@ -130,6 +134,10 @@ def main():
     parser.add_argument("--cuda", default="0")
     parser.add_argument("--datasets", nargs="+", default=["textvqa", "pope"],
                         choices=["textvqa", "pope", "mmbench"])
+    parser.add_argument("--mme-opt-only", action="store_true",
+                        help="Only run MME-opt configs, skip All B=1/2/4 baselines")
+    parser.add_argument("--merge", action="store_true",
+                        help="Use prune+merge token selection for all runs")
     args = parser.parse_args()
 
     # ── Build budget → mme_opt mapping ──
@@ -158,10 +166,11 @@ def main():
                 budget_configs[B] = {"n4": c["n4"], "n2": c["n2"], "n1": c["n1"]}
 
     RESULTS_DIR.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # ── Per dataset ──
     for dataset in args.datasets:
-        out_path = RESULTS_DIR / f"{dataset.upper()}.txt"
+        out_path = RESULTS_DIR / f"{dataset.upper()}_{timestamp}.txt"
         table    = load_table(out_path)
 
         for B, opt in sorted(budget_configs.items()):
@@ -172,17 +181,18 @@ def main():
             uni = uniform_configs(B)
 
             # All B=1 / B=2 / B=4
-            for label, (n4, n2, n1) in uni.items():
-                if table[b_str].get(label):
-                    print(f"[skip] {dataset} | {b_str} | {label} (already done)")
-                    continue
-                N = n4 + n2 + n1
-                if N == 0:
-                    table[b_str][label] = "N/A"
-                    continue
-                print(f"[run]  {dataset} | {b_str} | {label}  (n4={n4}, n2={n2}, n1={n1}, N={N})")
-                table[b_str][label] = run_validate(dataset, n4, n2, n1, args.cuda)
-                save_table(out_path, table)
+            if not args.mme_opt_only:
+                for label, (n4, n2, n1) in uni.items():
+                    if table[b_str].get(label):
+                        print(f"[skip] {dataset} | {b_str} | {label} (already done)")
+                        continue
+                    N = n4 + n2 + n1
+                    if N == 0:
+                        table[b_str][label] = "N/A"
+                        continue
+                    print(f"[run]  {dataset} | {b_str} | {label}  (n4={n4}, n2={n2}, n1={n1}, N={N})")
+                    table[b_str][label] = run_validate(dataset, n4, n2, n1, args.cuda, merge=args.merge)
+                    save_table(out_path, table)
 
             # MME-opt
             if table[b_str].get("MME-opt"):
@@ -192,7 +202,7 @@ def main():
             else:
                 n4, n2, n1 = opt["n4"], opt["n2"], opt["n1"]
                 print(f"[run]  {dataset} | {b_str} | MME-opt  (n4={n4}, n2={n2}, n1={n1})")
-                table[b_str]["MME-opt"] = run_validate(dataset, n4, n2, n1, args.cuda)
+                table[b_str]["MME-opt"] = run_validate(dataset, n4, n2, n1, args.cuda, merge=args.merge)
                 save_table(out_path, table)
 
         print(f"\n=== {dataset.upper()} ===")
