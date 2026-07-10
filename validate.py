@@ -30,9 +30,28 @@ SPLIT_SEED = 42
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
 PYTHON       = "/mnt/ssd/yenhsiu_envs/llava_eval/bin/python"
-MODEL_PATH        = "/mnt/ssd/yuzhang_models/llava-v1.5-7b"
-LORA_MODEL_PATH   = "/mnt/ssd/yuzhang_models/llava-prumerge-vicuna-7b-v1.5-lora"
-LORA_MODEL_BASE   = "lmsys/vicuna-7b-v1.5"
+MODEL_PATH             = "/mnt/ssd/yuzhang_models/llava-v1.5-7b"
+LORA_BASE_PATH         = "/mnt/ssd/yuzhang_models/llava-prumerge-vicuna-7b-v1.5-lora"
+LORA_PLUS_PATH         = "/mnt/ssd/yuzhang_models/llava-prumerge-plus-vicuna-7b-v1.5-lora"
+LORA_MODEL_BASE        = "lmsys/vicuna-7b-v1.5"
+
+
+def select_model(N: int) -> str:
+    """
+    N（選択トークン総数）に応じて使用モデルを決定論的に選択する。
+    閾値は PruMerge 論文の学習時 token 保持率
+    （base: 5.5%≈32 tokens, plus: 25.0%≈144 tokens,
+     Original: 576 tokens）から、隣接する学習分布の
+    幾何平均として算出：
+        threshold_base = sqrt(32 * 144) ≈ 68
+        threshold_plus = sqrt(144 * 576) ≈ 288
+    """
+    if N <= 68:
+        return "base_lora"
+    elif N <= 288:
+        return "plus_lora"
+    else:
+        return "original"
 CONFIGS_PATH = PROJECT_ROOT / "configs" / "optimal_configs.json"
 RESULTS_DIR  = PROJECT_ROOT / "results"
 
@@ -366,7 +385,14 @@ def main():
     # ── Inference ──
     inference_module = dataset_cfg.get("inference_module", "llava.eval.model_vqa_loader")
     if args.merge:
-        model_args = ["--model-path", LORA_MODEL_PATH, "--model-base", LORA_MODEL_BASE]
+        variant = select_model(N)
+        if variant == "base_lora":
+            model_args = ["--model-path", LORA_BASE_PATH, "--model-base", LORA_MODEL_BASE]
+        elif variant == "plus_lora":
+            model_args = ["--model-path", LORA_PLUS_PATH, "--model-base", LORA_MODEL_BASE]
+        else:
+            model_args = ["--model-path", MODEL_PATH]
+        print(f"Model:   {variant} (N={N})")
     else:
         model_args = ["--model-path", MODEL_PATH]
 

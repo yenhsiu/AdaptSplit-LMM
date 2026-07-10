@@ -138,6 +138,8 @@ def main():
                         help="Only run MME-opt configs, skip All B=1/2/4 baselines")
     parser.add_argument("--merge", action="store_true",
                         help="Use prune+merge token selection for all runs")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Directory to save results (default: results/)")
     args = parser.parse_args()
 
     # ── Build budget → mme_opt mapping ──
@@ -165,12 +167,13 @@ def main():
                 c = cfg["budgets"][key]
                 budget_configs[B] = {"n4": c["n4"], "n2": c["n2"], "n1": c["n1"]}
 
-    RESULTS_DIR.mkdir(exist_ok=True)
+    out_dir = args.output_dir if args.output_dir else RESULTS_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # ── Per dataset ──
     for dataset in args.datasets:
-        out_path = RESULTS_DIR / f"{dataset.upper()}_{timestamp}.txt"
+        out_path = out_dir / f"{dataset.upper()}_{timestamp}.txt"
         table    = load_table(out_path)
 
         for B, opt in sorted(budget_configs.items()):
