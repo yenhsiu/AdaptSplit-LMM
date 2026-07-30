@@ -29,27 +29,32 @@ SPLIT_SEED = 42
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
-PYTHON       = "/mnt/ssd/yenhsiu_envs/llava_eval/bin/python"
-MODEL_PATH             = "/mnt/ssd/yuzhang_models/llava-v1.5-7b"
-LORA_BASE_PATH         = "/mnt/ssd/yuzhang_models/llava-prumerge-vicuna-7b-v1.5-lora"
-LORA_PLUS_PATH         = "/mnt/ssd/yuzhang_models/llava-prumerge-plus-vicuna-7b-v1.5-lora"
+# PYTHON       = "/mnt/ssd/yenhsiu_envs/llava_eval/bin/python"
+# MODEL_PATH             = "/mnt/ssd/yuzhang_models/llava-v1.5-7b"
+# LORA_BASE_PATH         = "/mnt/ssd/yuzhang_models/llava-prumerge-vicuna-7b-v1.5-lora"
+# LORA_PLUS_PATH         = "/mnt/ssd/yuzhang_models/llava-prumerge-plus-vicuna-7b-v1.5-lora"
+LORA_MODEL_BASE        = "lmsys/vicuna-7b-v1.5"
+
+
+PYTHON       = "python"
+MODEL_PATH             = "/home/yenhsiu/llava-v1.5-7b"
+LORA_BASE_PATH         = "/home/yenhsiu/llava-prumerge-vicuna-7b-v1.5-lora"
+LORA_PLUS_PATH         = "/home/yenhsiu/llava-prumerge-plus-vicuna-7b-v1.5-lora"
 LORA_MODEL_BASE        = "lmsys/vicuna-7b-v1.5"
 
 
 def select_model(N: int) -> str:
     """
-    N（選択トークン総数）に応じて使用モデルを決定論的に選択する。
-    閾値は PruMerge 論文の学習時 token 保持率
-    （base: 5.5%≈32 tokens, plus: 25.0%≈144 tokens,
-     Original: 576 tokens）から、隣接する学習分布の
-    幾何平均として算出：
-        threshold_base = sqrt(32 * 144) ≈ 68
-        threshold_plus = sqrt(144 * 576) ≈ 288
+    Threshold calibrated empirically on MME (--no-quant, pure N effect,
+    McNemar's test, N=16..576): base_lora wins/ties up to ~N=175, then a
+    statistically ambiguous zone (144-288) where no checkpoint is
+    significantly better, then original leads from N=238 onward and never
+    gives it back (significant from N=288). plus_lora never showed a
+    significant advantage anywhere in the swept range, so it's dropped from
+    the routing rule (see threshold_calibration.py / threshold_calibration.result.json).
     """
-    if N <= 68:
+    if N < 596:
         return "base_lora"
-    elif N <= 288:
-        return "plus_lora"
     else:
         return "original"
 CONFIGS_PATH = PROJECT_ROOT / "configs" / "optimal_configs.json"
@@ -117,11 +122,17 @@ def parse_args():
                         help="Use a subset: 'search' = first split-ratio%%, 'val' = remaining, 'all' = full dataset")
     parser.add_argument("--split-ratio", type=float, default=0.3,
                         help="Fraction of data used as search set (default: 0.3)")
-    parser.add_argument("--no-save", action="store_true",
-                        help="Skip saving results to txt file (used during search)")
+    parser.add_argument("--split-seed", type=int, default=SPLIT_SEED,
+                        help=f"Seed for the search/val split (default: {SPLIT_SEED}). "
+                             "Override to draw an independent random subset, e.g. for repeated-resample noise checks.")
+    parser.add_argument("--save", action="store_true",
+                        help="Save results to a results/*.txt file (default: off)")
 
     parser.add_argument("--merge", action="store_true",
                         help="Use prumerge_quant_merge (prune + merge) instead of prune-only")
+    parser.add_argument("--force-model", choices=["base_lora", "plus_lora", "original"],
+                        default=None,
+                        help="Override automatic checkpoint routing (calibration use only)")
 
     # Mode flags
     parser.add_argument("--baseline",  action="store_true")
@@ -175,8 +186,11 @@ def resolve_config(args):
 
 # ── Split logic ───────────────────────────────────────────────────────────────
 
-def get_split_question_file(dataset_cfg: dict, split: str, ratio: float) -> Path:
-    """Return path to split question file, creating it if it doesn't exist yet."""
+def get_split_question_file(dataset_cfg: dict, split: str, ratio: float, seed: int = SPLIT_SEED) -> Path:
+    """Return path to split question file, creating it if it doesn't exist yet.
+    `seed` defaults to the module-wide SPLIT_SEED (reproducible, backward
+    compatible); pass a different seed to draw an independent random subset
+    (e.g. for repeated-resample noise estimation)."""
     question_file = PROJECT_ROOT / dataset_cfg["question_file"]
     if split == "all":
         return question_file
@@ -185,7 +199,7 @@ def get_split_question_file(dataset_cfg: dict, split: str, ratio: float) -> Path
     split_dir.mkdir(exist_ok=True)
 
     ratio_tag  = f"r{int(ratio * 100)}"
-    split_file = split_dir / f"{question_file.stem}_{split}_{ratio_tag}_seed{SPLIT_SEED}{question_file.suffix}"
+    split_file = split_dir / f"{question_file.stem}_{split}_{ratio_tag}_seed{seed}{question_file.suffix}"
 
     if split_file.exists():
         return split_file
@@ -194,7 +208,7 @@ def get_split_question_file(dataset_cfg: dict, split: str, ratio: float) -> Path
 
     if suffix == ".jsonl":
         lines = question_file.read_text().strip().splitlines()
-        rng = random.Random(SPLIT_SEED)
+        rng = random.Random(seed)
         indices = list(range(len(lines)))
         rng.shuffle(indices)
         n_search = int(len(indices) * ratio)
@@ -207,7 +221,7 @@ def get_split_question_file(dataset_cfg: dict, split: str, ratio: float) -> Path
         data = json.loads(question_file.read_text())
         if isinstance(data, dict):
             keys = list(data.keys())
-            rng  = random.Random(SPLIT_SEED)
+            rng  = random.Random(seed)
             rng.shuffle(keys)
             n_search     = int(len(keys) * ratio)
             chosen_keys  = keys[:n_search] if split == "search" else keys[n_search:]
@@ -215,7 +229,7 @@ def get_split_question_file(dataset_cfg: dict, split: str, ratio: float) -> Path
             split_file.write_text(json.dumps(selected_data, indent=2))
             print(f"[split] {split} ({len(chosen_keys)}/{len(keys)} items) → {split_file.name}")
         else:
-            rng = random.Random(SPLIT_SEED)
+            rng = random.Random(seed)
             shuffled = data[:]
             rng.shuffle(shuffled)
             n_search     = int(len(shuffled) * ratio)
@@ -227,7 +241,7 @@ def get_split_question_file(dataset_cfg: dict, split: str, ratio: float) -> Path
         lines  = question_file.read_text().splitlines()
         header = lines[0]
         rows   = lines[1:]
-        rng    = random.Random(SPLIT_SEED)
+        rng    = random.Random(seed)
         indices = list(range(len(rows)))
         rng.shuffle(indices)
         n_search = int(len(indices) * ratio)
@@ -369,23 +383,25 @@ def main():
 
     dataset_cfg  = DATASET_CONFIG[args.dataset]
     split_tag    = f"_{args.split}" if args.split != "all" else ""
-    exp_name     = f"validate_{args.dataset}{split_tag}_{mode_tag}"
+    seed_tag     = f"_seed{args.split_seed}" if args.split != "all" and args.split_seed != SPLIT_SEED else ""
+    force_tag    = f"_{args.force_model}" if args.force_model else ""
+    exp_name     = f"validate_{args.dataset}{split_tag}{seed_tag}_{mode_tag}{force_tag}"
     answers_file = PROJECT_ROOT / dataset_cfg["answers_dir"] / f"{exp_name}.jsonl"
     env          = build_env(n4, n2, n1, use_quant, args.cuda, merge=args.merge)
 
-    question_file = get_split_question_file(dataset_cfg, args.split, args.split_ratio)
+    question_file = get_split_question_file(dataset_cfg, args.split, args.split_ratio, args.split_seed)
 
     print(f"=== Validate: {args.dataset.upper()} ===")
     print(f"Mode:    {'baseline' if not use_quant and N==576 else ('no-quant' if not use_quant else 'quant')}")
     print(f"Config:  n4={n4}, n2={n2}, n1={n1}, N={N}")
-    print(f"Split:   {args.split} (ratio={args.split_ratio}, seed={SPLIT_SEED})")
+    print(f"Split:   {args.split} (ratio={args.split_ratio}, seed={args.split_seed})")
     print(f"Exp:     {exp_name}")
     print("=" * 35)
 
     # ── Inference ──
     inference_module = dataset_cfg.get("inference_module", "llava.eval.model_vqa_loader")
     if args.merge:
-        variant = select_model(N)
+        variant = args.force_model if args.force_model else select_model(N)
         if variant == "base_lora":
             model_args = ["--model-path", LORA_BASE_PATH, "--model-base", LORA_MODEL_BASE]
         elif variant == "plus_lora":
@@ -430,7 +446,7 @@ def main():
     print(output)
 
     # ── Save results ──
-    if not args.no_save:
+    if args.save:
         RESULTS_DIR.mkdir(exist_ok=True)
         timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
         result_file = RESULTS_DIR / f"{exp_name}_{timestamp}.txt"

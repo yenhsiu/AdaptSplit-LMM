@@ -1,5 +1,5 @@
 #!/bin/bash
-PYTHON=/mnt/ssd/yenhsiu_envs/llava_eval/bin/python
+PYTHON=python
 
 # ============================================================
 # Configuration — only change this section
@@ -12,13 +12,13 @@ QUANT_BITS=1           # 1 |2 | 4 |
 
 # Auto model path mapping
 if [ "$METHOD" = "original" ]; then
-    MODEL_PATH=/mnt/ssd/yuzhang_models/llava-v1.5-7b
+    MODEL_PATH=~/llava-v1.5-7b
     MODEL_BASE=""
 elif [ "$METHOD" = "prumerge" ]; then
-    MODEL_PATH=/mnt/ssd/yuzhang_models/llava-prumerge-vicuna-7b-v1.5-lora
+    MODEL_PATH=~/llava-prumerge-vicuna-7b-v1.5-lora
     MODEL_BASE=lmsys/vicuna-7b-v1.5
 elif [ "$METHOD" = "prumerge_plus" ]; then
-    MODEL_PATH=/mnt/ssd/yuzhang_models/llava-prumerge-plus-vicuna-7b-v1.5-lora
+    MODEL_PATH=~/llava-prumerge-plus-vicuna-7b-v1.5-lora
     MODEL_BASE=lmsys/vicuna-7b-v1.5
 else
     echo "Unknown METHOD: $METHOD. Use original | prumerge | prumerge_plus"

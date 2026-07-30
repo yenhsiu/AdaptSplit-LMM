@@ -15,7 +15,7 @@
 
 set -e
 
-PYTHON=/mnt/ssd/yenhsiu_envs/llava_eval/bin/python
+PYTHON=python
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # ── Default CUDA ──

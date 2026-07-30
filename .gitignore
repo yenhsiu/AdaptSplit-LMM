@@ -37,4 +37,8 @@ PRUMERGE_METHOD=*
 
 *.pyc
 *.png
+*.txt
+*.json
+*.out
+
 

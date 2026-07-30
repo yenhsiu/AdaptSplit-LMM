@@ -26,7 +26,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
-PYTHON       = "/mnt/ssd/yenhsiu_envs/llava_eval/bin/python"
+PYTHON       = "python"
 VALIDATE_PY  = PROJECT_ROOT / "validate.py"
 RESULTS_DIR  = PROJECT_ROOT / "results"
 
@@ -47,10 +47,15 @@ def parse_mmbench(text: str) -> str:
     m = re.search(r"MMBench Dev Accuracy:\s*([\d.]+)%", text)
     return f"{float(m.group(1)):.2f}%" if m else "N/A"
 
+def parse_mme(text: str) -> str:
+    m = re.search(r"Combined Total Score:\s*([\d.]+)", text)
+    return f"{float(m.group(1)):.4f}" if m else "N/A"
+
 PARSERS = {
     "textvqa": parse_textvqa,
     "pope":    parse_pope,
     "mmbench": parse_mmbench,
+    "mme":     parse_mme,
 }
 
 # ── Validation runner ─────────────────────────────────────────────────────────
@@ -133,7 +138,7 @@ def main():
                        help="Budget(s) to validate (looks up MME-opt from configs/optimal_configs.json)")
     parser.add_argument("--cuda", default="0")
     parser.add_argument("--datasets", nargs="+", default=["textvqa", "pope"],
-                        choices=["textvqa", "pope", "mmbench"])
+                        choices=["textvqa", "pope", "mmbench", "mme"])
     parser.add_argument("--mme-opt-only", action="store_true",
                         help="Only run MME-opt configs, skip All B=1/2/4 baselines")
     parser.add_argument("--merge", action="store_true",

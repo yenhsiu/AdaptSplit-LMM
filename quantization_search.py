@@ -9,7 +9,24 @@ Constraints:
   n4 + n2 + n1 ≤ 576              (token cap)
   n4, n2, n1 ≥ 0
 
-n1 is derived automatically: n1 = (B // 1024) - 4·n4 - 2·n2
+Sampling: (n4, n2, n1) is parameterized via two cut points (u1, u2) on the
+*budget-proportion* simplex (not the raw token-count simplex -- token counts
+have unequal per-unit cost: 4/2/1 -- cutting the token-count simplex directly
+silently breaks the budget equality for any non-corner point). This makes the
+three uniform-bit-width corners (All B=1/2/4) and interior points reachable
+with comparable probability; the old n4-then-n2-then-n1 sequential sampling
+gave n4 a disproportionately large range, making corner solutions (all three
+uniform-bit-width baselines) exponentially unlikely to ever be sampled --
+that bias is the confirmed root cause of searched configs underperforming
+the trivial uniform baselines on generalization (POPE/MMBench).
+
+Each budget also gets 3-4 anchor points (All B=1, All B=2, All B=4, and --
+when the budget supports averaging >=1 bit/token across all 576 tokens --
+the "N=576, no pruning" mixed-bit point) explicitly enqueued as the first
+trials, so the search can never do worse than a baseline it never tried.
+
+n1 is always the residual that exactly absorbs the budget equation:
+n1 = (B // 1024) - 4·n4 - 2·n2
 
 Supported datasets: mme, textvqa, pope, scienceqa, mmbench, vqav2
 
@@ -52,10 +69,8 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-PYTHON      = "/mnt/ssd/yenhsiu_envs/llava_eval/bin/python"
-MODEL_PATH  = "/mnt/ssd/yuzhang_models/llava-v1.5-7b"
+PYTHON      = "python"
 PROJECT_ROOT = Path(__file__).parent.resolve()
-MME_DIR     = PROJECT_ROOT / "playground/data/eval/MME"
 
 
 
@@ -68,8 +83,7 @@ def run_eval(dataset: str, n4: int, n2: int, n1: int, exp_name: str, cuda: str,
            "--dataset", dataset,
            "--n4", str(n4), "--n2", str(n2), "--n1", str(n1),
            "--split", split, "--split-ratio", str(split_ratio),
-           "--cuda", cuda,
-           "--no-save"]
+           "--cuda", cuda]
     if merge:
         cmd.append("--merge")
     result = subprocess.run(
@@ -100,65 +114,133 @@ def run_eval(dataset: str, n4: int, n2: int, n1: int, exp_name: str, cuda: str,
 
 # ── Optuna ask-and-tell ───────────────────────────────────────────────────────
 
+N_MAX = 576  # CLIP patch count -- hard cap on n4+n2+n1
+
 
 def sample_params(trial: optuna.Trial, S: int):
+    """Two cut points on the *budget-proportion* simplex (p4, p2, p1), each
+    proportion then divided by its tier's per-token cost (4, 2, 1) to get a
+    token count. n1 absorbs rounding residual so 4n4+2n2+n1==T always holds
+    exactly, regardless of where (u1, u2) land -- including all three
+    uniform-bit-width corners."""
     T = S // 1024
-    n4 = trial.suggest_int("n4", 0, T // 4)
-    n2 = trial.suggest_int("n2", 0, (T - 4 * n4) // 2)
-    n1 = T - 4 * n4 - 2 * n2  # equality constraint: always use full budget
+    u1 = trial.suggest_float("u1", 0, 1)
+    u2 = trial.suggest_float("u2", 0, 1)
+    lo, hi = min(u1, u2), max(u1, u2)
+    p4, p2 = lo, hi - lo  # p1 = 1 - hi, implicit
+
+    n4 = round(p4 * T / 4)
+    n2 = round(p2 * T / 2)
+    n1 = T - 4 * n4 - 2 * n2
     return n4, n2, n1
 
 
 def is_feasible(n4: int, n2: int, n1: int) -> bool:
     N = n4 + n2 + n1
-    return n1 >= 0 and N > 0 and N <= 576
+    return n1 >= 0 and N > 0 and N <= N_MAX
+
+
+def get_anchor_points(S: int) -> list:
+    """All-B1 / All-B2 / All-B4, plus (when the budget allows an average of
+    at least 1 bit/token across all N_MAX tokens) the "no pruning" point --
+    each only included if it's actually feasible at this exact budget."""
+    T = S // 1024
+    anchors = []
+
+    if T <= N_MAX:  # else n1=T > N_MAX tokens needed: infeasible, must skip
+        anchors.append({"n4": 0, "n2": 0, "n1": T})
+    if T <= 2 * N_MAX:
+        anchors.append({"n4": 0, "n2": T // 2, "n1": T - 2 * (T // 2)})
+    if T <= 4 * N_MAX:
+        anchors.append({"n4": T // 4, "n2": 0, "n1": T - 4 * (T // 4)})
+
+    # N=576 (no pruning), 1-bit/2-bit mix -- only exact for T in [N_MAX, 2*N_MAX]
+    if N_MAX <= T <= 2 * N_MAX:
+        n2 = T - N_MAX
+        n1 = N_MAX - n2
+        anchors.append({"n4": 0, "n2": n2, "n1": n1})
+    # NOTE: for T > 2*N_MAX, the analogous "N=576, 2-bit/4-bit mix" point
+    # would need a 3-way solver (not yet implemented) -- deliberately
+    # skipped rather than emitting a point that silently underspends budget.
+
+    feasible = [a for a in anchors if is_feasible(a["n4"], a["n2"], a["n1"])]
+    deduped = list({(a["n4"], a["n2"], a["n1"]): a for a in feasible}.values())
+    return deduped
+
+
+def anchor_to_u1u2(n4: int, n2: int, n1: int, T: int) -> dict:
+    """Inverse of sample_params: given a target (n4, n2, n1), find (u1, u2)
+    that reproduce it exactly (up to the same rounding sample_params itself
+    would apply)."""
+    p4 = 4 * n4 / T
+    p2 = 2 * n2 / T
+    lo, hi = p4, p4 + p2
+    return {"u1": lo, "u2": hi}
 
 
 
-def search(dataset: str, S: int, n_trials: int, cuda: str, split_ratio: float = 0.3, merge: bool = False, seed: int = 42) -> dict:
+def search(dataset: str, S: int, n_trials: int, cuda: str, split: str = "all",
+           split_ratio: float = 0.3, merge: bool = False, seed: int = 42) -> dict:
+    T = S // 1024
+
+    # Always a fresh study -- (u1, u2) is a different parameter space than
+    # the old (n4, n2) sampler, so there is nothing meaningful to resume.
     study = optuna.create_study(
         direction="maximize",
         sampler=optuna.samplers.TPESampler(seed=seed),
     )
+
+    anchors = get_anchor_points(S)
+    anchor_keys = {(a["n4"], a["n2"], a["n1"]) for a in anchors}
+    for a in anchors:
+        study.enqueue_trial(anchor_to_u1u2(a["n4"], a["n2"], a["n1"], T))
+    print(f"  [anchors] {len(anchors)} enqueued: {anchors}")
+
+    history = []  # full per-trial record, incl. pruned
     trial_count = 0
     while trial_count < n_trials:
         trial = study.ask()
         n4, n2, n1 = sample_params(trial, S)
+        is_anchor = (n4, n2, n1) in anchor_keys
 
         if not is_feasible(n4, n2, n1):
             study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+            history.append({"trial": trial_count, "u1": trial.params["u1"], "u2": trial.params["u2"],
+                             "n4": n4, "n2": n2, "n1": n1, "N": n4 + n2 + n1,
+                             "source": "anchor" if is_anchor else "tpe",
+                             "score": None, "state": "pruned"})
             continue
 
+        source = "anchor" if is_anchor else "tpe"
         exp_name = f"search_{dataset}_S{S}_t{trial_count:03d}_n4{n4}_n2{n2}_n1{n1}"
-        print(f"\n  trial {trial_count:3d}: n4={n4:3d}, n2={n2:3d}, n1={n1:3d}, "
+        print(f"\n  trial {trial_count:3d} [{source}]: n4={n4:3d}, n2={n2:3d}, n1={n1:3d}, "
               f"N={n4+n2+n1:3d}  →  {exp_name}")
 
-        score = run_eval(dataset, n4, n2, n1, exp_name, cuda, split="all", split_ratio=split_ratio, merge=merge)
+        score = run_eval(dataset, n4, n2, n1, exp_name, cuda, split=split, split_ratio=split_ratio, merge=merge)
         print(f"           score = {score:.4f}")
 
         study.tell(trial, score)
+        history.append({"trial": trial_count, "u1": trial.params["u1"], "u2": trial.params["u2"],
+                         "n4": n4, "n2": n2, "n1": n1, "N": n4 + n2 + n1,
+                         "source": source, "score": score, "state": "complete"})
         trial_count += 1
 
-    # ── Summary ──
-    T = S // 1024
-    best = study.best_trial
-    n4 = best.params["n4"]; n2 = best.params["n2"]
-    n1 = T - 4 * n4 - 2 * n2
-    N  = n4 + n2 + n1
+    # ── Summary (from our own history, not study.best_trial -- avoids
+    #    re-deriving n4/n2/n1 from raw u1/u2 params) ──
+    completed = [h for h in history if h["state"] == "complete"]
+    best = max(completed, key=lambda h: h["score"])
+    n4, n2, n1, N = best["n4"], best["n2"], best["n1"], best["N"]
 
-    print(f"\n[Best] n4={n4}, n2={n2}, n1={n1}, N={N}, "
-          f"top_ratio={n4/N:.3f}, score={best.value:.4f}")
+    print(f"\n[Best] n4={n4}, n2={n2}, n1={n1}, N={N}, source={best['source']}, "
+          f"top_ratio={n4/N:.3f}, score={best['score']:.4f}")
     print("[Top 5]")
-    for t in sorted(study.trials, key=lambda t: t.value or 0, reverse=True)[:5]:
-        _n4 = t.params["n4"]; _n2 = t.params["n2"]
-        _n1 = T - 4 * _n4 - 2 * _n2
-        _N  = _n4 + _n2 + _n1
-        if _N == 0: continue
-        print(f"  n4={_n4:3d}, n2={_n2:3d}, n1={_n1:3d}, N={_N:3d}, "
-              f"top_ratio={_n4/_N:.3f}, score={t.value:.4f}")
+    for h in sorted(completed, key=lambda h: h["score"], reverse=True)[:5]:
+        print(f"  n4={h['n4']:3d}, n2={h['n2']:3d}, n1={h['n1']:3d}, N={h['N']:3d}, "
+              f"source={h['source']:>6}, top_ratio={h['n4']/h['N']:.3f}, score={h['score']:.4f}")
 
     return {"dataset": dataset, "S": S, "n4": n4, "n2": n2, "n1": n1, "N": N,
-            "top_ratio": n4/N if N > 0 else 0.0, "score": best.value}
+            "top_ratio": n4 / N if N > 0 else 0.0, "score": best["score"],
+            "anchors": anchors, "trials": history}
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -169,8 +251,10 @@ def main():
                         choices=["mme", "textvqa", "pope", "scienceqa", "mmbench", "vqav2"])
     parser.add_argument("--budgets",     nargs="+", type=int, default=[115500, 266240, 589824])
     parser.add_argument("--n-trials",   type=int,   default=50)
+    parser.add_argument("--split",       default="all", choices=["all", "search", "val"],
+                        help="Which subset of the dataset each trial evaluates on (default: all)")
     parser.add_argument("--split-ratio", type=float, default=0.3,
-                        help="Fraction of data used as search set (default: 0.3)")
+                        help="Fraction of data used as search set when --split=search/val (default: 0.3)")
     parser.add_argument("--cuda",        default="0")
     parser.add_argument("--output",      default=None,
                         help="Path to save results JSON (default: results/search_<dataset>_<timestamp>.json)")
@@ -183,11 +267,13 @@ def main():
     results = []
     for S in args.budgets:
         print(f"\n{'='*40}\nDataset: {args.dataset}  Budget: {S}\n{'='*40}")
-        results.append(search(args.dataset, S, args.n_trials, args.cuda, args.split_ratio, merge=args.merge, seed=args.seed))
+        results.append(search(args.dataset, S, args.n_trials, args.cuda, split=args.split,
+                               split_ratio=args.split_ratio, merge=args.merge, seed=args.seed))
 
     print("\n\n=== Search Summary ===")
     import pandas as pd
-    print(pd.DataFrame(results).set_index(["dataset", "S"]).to_string())
+    summary_only = [{k: v for k, v in r.items() if k not in ("anchors", "trials")} for r in results]
+    print(pd.DataFrame(summary_only).set_index(["dataset", "S"]).to_string())
 
     # ── Save results ──
     out_dir = PROJECT_ROOT / "results"

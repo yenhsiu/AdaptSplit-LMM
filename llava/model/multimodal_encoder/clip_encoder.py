@@ -165,6 +165,15 @@ class CLIPVisionTower(nn.Module):
         x_others = torch.gather(image_features, dim=1, index=index)          # [B, N, C]
         x_others_attn = torch.gather(cls_attn, dim=1, index=top_idx)         # [B, N]
 
+        if n_tokens >= N_total:
+            # No leftover (non-topk) tokens to merge in -- every token is
+            # already selected. Falling through to the merge loop below would
+            # degenerate into averaging every token with every *other* kept
+            # token (since `compl` is empty), which is a different, far more
+            # destructive operation than the intended "merge unselected
+            # tokens into selected ones". Nothing to merge: return as-is.
+            return x_others
+
         compl = complement_idx(top_idx, N_total)                              # [B, 576-N]
         non_topk = torch.gather(image_features, dim=1,
                                 index=compl.unsqueeze(-1).expand(-1, -1, C)) # [B, 576-N, C]
